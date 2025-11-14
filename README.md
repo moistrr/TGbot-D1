@@ -1,8 +1,8 @@
-## 🚀 Telegram 双向客服机器人 Cloudflare Worker
+## 🚀 Telegram 双向机器人 Cloudflare Worker
 
 ### 功能简介
 
-这是一个基于 Cloudflare Worker 和 D1 数据库的 Telegram 双向客服机器人代码。它将用户私聊消息转发到管理员群组的话题（Topic）中，并将管理员在话题中的回复中继回用户私聊。
+这是一个基于 Cloudflare Worker 和 D1 数据库的 Telegram 双向机器人代码。它将用户私聊消息转发到管理员群组的话题（Topic）中，并将管理员在话题中的回复中继回用户私聊。
 
 #### 核心特性与最新增强：
 

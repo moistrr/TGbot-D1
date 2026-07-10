@@ -196,3 +196,11 @@ https://api.telegram.org/bot<您的BOT_TOKEN>/setWebhook?url=<您的Worker服务
 * 33、数据库迁移在每个Worker实例中只执行一次，降低每次收到消息时重复初始化数据库造成的性能消耗。
 * 34、优化异步任务异常捕获，消息处理失败时会在Worker日志中输出详细错误，方便快速定位故障。
 * 35、增加非法JSON请求、非POST请求及未授权Webhook请求处理，提高Worker接口的安全性和稳定性。
+
+
+---
+
+## 📖 部署教程
+
+👉 [点击查看创新版 3.0.0 详细部署教程](https://github.com/moistrr/TGbot-D1/blob/main/3.0.0%E5%88%9B%E6%96%B0%E7%89%88%E9%83%A8%E7%BD%B2%E6%95%99%E7%A8%8B.md)
+

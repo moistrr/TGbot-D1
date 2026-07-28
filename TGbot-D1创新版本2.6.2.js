@@ -52,6 +52,12 @@ async function dbConfigGet(key, env) {
         delete data.user_info; // 移除原始对象以避免与 SQL 冲突
     }
     
+    // 白名单校验字段名，防止 SQL 注入
+    const ALLOWED_COLUMNS = new Set(['topic_id', 'user_state', 'is_blocked', 'is_muted', 'block_count', 'user_info_json']);
+    Object.keys(data).forEach(key => {
+        if (!ALLOWED_COLUMNS.has(key)) throw new Error(`Invalid column: ${key}`);
+    });
+
     // 构造 SQL 语句
     const fields = Object.keys(data).map(key => {
         // [⭐️ 修改] 特殊处理 is_blocked 和 is_muted (布尔值)
@@ -69,7 +75,7 @@ async function dbConfigGet(key, env) {
          return data[key];
     });
     
-    await env.TG_BOT_DB.prepare(`UPDATE users SET ${fields} WHERE user_id = ?`).bind(...values, userId).run();
+    await env.TG_BOT_DB.prepare("UPDATE users SET " + fields + " WHERE user_id = ?").bind(...values, userId).run();
   }
   
   /**
@@ -106,7 +112,7 @@ async function dbConfigGet(key, env) {
   * [D1 Abstraction] 清除管理员编辑状态
   */
   async function dbAdminStateDelete(userId, env) {
-    await env.TG_BOT_DB.prepare("DELETE FROM config WHERE key = ?").bind(`admin_state:${userId}`).run();
+    await env.TG_BOT_DB.prepare("DELETE FROM config WHERE key = ?").bind("admin_state:" + userId).run();
   }
   
   /**
@@ -584,9 +590,8 @@ async function ensureBlockLogTopicExists(env) {
             
             for (const keyword of blockKeywords) {
                 try {
-                    // 使用新结构中的字符串构建 RegExp
-                    const regex = new RegExp(keyword, 'gi'); 
-                    if (regex.test(text)) {
+                    // 使用大小写不敏感的字符串包含检测替代 RegExp
+                    if (text.toLowerCase().includes(keyword.toLowerCase())) {
                         currentCount += 1;
                         
                         // 更新 D1 中的屏蔽计数
@@ -722,9 +727,8 @@ async function ensureBlockLogTopicExists(env) {
             
             for (const rule of autoResponseRules) {
                 try {
-                    // 使用新结构中的 keywords 字符串构建 RegExp
-                    const regex = new RegExp(rule.keywords, 'gi'); 
-                    if (regex.test(text)) {
+                    // 使用大小写不敏感的字符串包含检测替代 RegExp
+                    if (text.toLowerCase().includes(rule.keywords.toLowerCase())) {
                         const autoReplyPrefix = "此消息为自动回复\n\n";
                         await telegramApi(env.BOT_TOKEN, "sendMessage", {
                             chat_id: chatId,

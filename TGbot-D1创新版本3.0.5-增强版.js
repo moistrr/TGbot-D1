@@ -31,7 +31,7 @@
  * 台（原按钮菜单已下线，旧按钮回迁移提示）；新手引导 /guide；
  * 自动检查更新；服务熔断 /pause /resume（手动触发，闸门在去重之
  * 前；到期惰性恢复——由到期后第一条更新触发解除并通知，属刻意
- * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数；命令回执类话题通知（备注查看/保存/删除、重置验证、封禁/解封结果、资料卡重建、话题内熔断开启/恢复/状态结果、未识别命令）改为短暂显示，发出约 5 秒后自动删除；访客解除拉黑、发出 ✅ 提醒时，之前那条 🚫 拉黑提醒会被一并删掉（编号记在 blocknotice:<访客>）；话题里管理员发出的命令消息在处理后一并撤回（未识别的命令同样），只短暂留回执、不留命令原文；主菜单追踪记录带写入时间戳，超过 48 小时（记录里的消息号已过 Telegram 删除窗口）会被数据库清扫整行删掉，读到过期记录时也直接跳过注定失败的删除。
+ * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数；命令回执类话题通知（备注查看/保存/删除、重置验证、封禁/解封结果、资料卡重建、话题内熔断开启/恢复/状态结果、未识别命令）改为短暂显示，发出约 5 秒后自动删除；访客解除拉黑、发出 ✅ 提醒时，之前那条 🚫 拉黑提醒会被一并删掉（编号记在 blocknotice:<访客>）；话题里管理员发出的命令消息在处理后一并撤回（未识别的命令同样），只短暂留回执、不留命令原文；主菜单追踪记录带写入时间戳，超过 48 小时（记录里的消息号已过 Telegram 删除窗口）会被数据库清扫整行删掉，读到过期记录时也直接跳过注定失败的删除。第四轮审计修复：问答验证答错 5 次锁定 30 分钟防穷举；三页签名链接按用途分权（引导/列表/管理台互不通用），签名密钥可改用独立的 LINK_SECRET 与 webhook 校验值解耦（未配置时回退 WEBHOOK_SECRET）；整段对话清空仅主管理员可操作、确认防重复执行、访客记录已删时点确认不再把空档案建回来，且清空只删开始那一刻收集到的快照记录（清空期间新到的消息配对不受影响），提示行改分块批量查询与批量删除；拉黑提醒记账竞态收尾，删档与超时清理一并清记账；主菜单追踪清扫按值条件删防误删新鲜记录、原地编辑不再刷新追踪时间戳（时间戳只记消息号的出生时刻）、旧格式纯数字追踪恢复解析；话题被手动关闭时先重开原话题再投递、不再误判失效重建；转发失败（内容受保护等）会在话题里提醒、群权限丢失时改走主管理员私聊告警；已验证访客发送过频会被限流丢弃并提醒；反应同步补匿名管理员处理，付费/自定义 emoji 不再误清已镜像的普通反应；短暂通知落 ephem 记账，定时删除没赶上时由数据库清扫补删；菜单签名链接的来源地址改为随请求传递（去掉可被任意请求覆盖的全局变量）；以频道身份发帖等没有 from 的消息直接忽略、不再抛错；命令 @ 的机器人名不是本机器人时完全忽略；/note 保存失败时保留命令原文便于改了重发。
  * 三页（指南 / 管理台 / 访客列表）约定
  * - 页眉 position:fixed + 脚本实测高度补偿 body padding-top，
  *   不要改回 sticky：iOS 上 sticky 在滚动中逐帧重定位会闪烁。
@@ -391,11 +391,20 @@ function isTopicInvalidError(error) {
 
   return (
     text.includes('message thread not found') ||
-    text.includes('message thread is closed') ||
-    text.includes('topic_closed') ||
     text.includes('topic was deleted') ||
     text.includes('forum topic was closed') ||
     text.includes('message thread id is invalid')
+  );
+}
+
+// 话题只是被管理员手动「关闭」（不是删除/失效）：
+// 关闭不该触发重建新话题，调用方先尝试重开原话题。
+function isTopicClosedError(error) {
+  const text = String(error?.message || error).toLowerCase();
+
+  return (
+    text.includes('message thread is closed') ||
+    text.includes('topic_closed')
   );
 }
 
@@ -664,6 +673,66 @@ async function ensureMigration(env) {
   return migrationPromise;
 }
 
+// 短暂通知补删清扫：定时删除随请求上下文被回收时
+// 没删成的回执，按 ephem: 记账在这里补删。
+async function sweepEphemeralNotices(env) {
+  let rows = [];
+
+  try {
+    const result = await env.TG_BOT_DB.prepare(
+      'SELECT key, value FROM config ' +
+        'WHERE key LIKE ?'
+    )
+      .bind('ephem:%')
+      .all();
+
+    rows = result?.results || [];
+  } catch (error) {
+    console.error(
+      '读取短暂通知记账失败：',
+      error?.message || error
+    );
+
+    return;
+  }
+
+  const nowMs = Date.now();
+
+  for (const row of rows) {
+    const msgId = String(row.key).slice(6);
+
+    if (!/^\d+$/.test(msgId)) {
+      await dbConfigDelete(String(row.key), env);
+
+      continue;
+    }
+
+    let parsed = null;
+
+    try {
+      parsed = JSON.parse(row.value);
+    } catch (_) {
+      parsed = null;
+    }
+
+    const dueAt = Number(parsed?.at || 0);
+
+    if (dueAt && dueAt <= nowMs) {
+      await quietDeleteMessage(
+        env,
+        parsed?.c || env.ADMIN_GROUP_ID,
+        msgId
+      );
+
+      await dbConfigDeleteIfValue(
+        String(row.key),
+        String(row.value),
+        env
+      );
+    }
+  }
+}
+
 async function cleanupDatabase(env) {
   const now = Math.floor(Date.now() / 1000);
   const cutoff = now - DATABASE_RETENTION_SECONDS;
@@ -683,6 +752,8 @@ async function cleanupDatabase(env) {
     await cleanupExpiredUsers(env, now);
 
     await cleanupStaleMenuTracks(env);
+
+    await sweepEphemeralNotices(env);
   } catch (error) {
     console.error(
       '清理数据库失败：',
@@ -728,7 +799,13 @@ async function cleanupStaleMenuTracks(env) {
     }
 
     if (t && nowMs - t > MENU_TRACK_TTL_MS) {
-      await dbConfigDelete(String(row.key), env);
+      // 按快照值条件删：枚举之后管理员恰好开了菜单、
+      // 写入了新鲜记录时，不要把新鲜行误删掉。
+      await dbConfigDeleteIfValue(
+        String(row.key),
+        String(row.value),
+        env
+      );
     }
   }
 }
@@ -827,6 +904,11 @@ async function cleanupExpiredUsers(env, now) {
 
     await dbConfigDelete(
       `promptat:${userId}`,
+      env
+    );
+
+    await dbConfigDelete(
+      `blocknotice:${userId}`,
       env
     );
   }
@@ -1148,17 +1230,27 @@ async function dbMessageDataPut(
   ).run();
 }
 
+function messageDataDeleteStatement(
+  userId,
+  messageId,
+  env
+) {
+  return env.TG_BOT_DB.prepare(
+    'DELETE FROM messages ' +
+    'WHERE user_id = ? AND message_id = ?'
+  ).bind(String(userId), String(messageId));
+}
+
 async function dbMessageDataDelete(
   userId,
   messageId,
   env
 ) {
-  await env.TG_BOT_DB.prepare(
-    'DELETE FROM messages ' +
-    'WHERE user_id = ? AND message_id = ?'
-  )
-    .bind(String(userId), String(messageId))
-    .run();
+  await messageDataDeleteStatement(
+    userId,
+    messageId,
+    env
+  ).run();
 }
 
 async function dbMessageDataGet(
@@ -2580,79 +2672,115 @@ async function relayUserMessageToTopic(
     copiedMessageId =
       copyResult?.message_id || null;
   } catch (error) {
-    if (!isTopicInvalidError(error)) {
+    if (isTopicClosedError(error)) {
+      // 话题只是被手动关闭：重开原话题后重投一次，
+      // 不把「关闭」当「失效」去新建一个话题顶替。
+      // 重开或重投失败时异常自然上抛，由调用方走
+      // 转发失败通知。
+      await telegramApi(
+        env.BOT_TOKEN,
+        'reopenForumTopic',
+        {
+          chat_id: env.ADMIN_GROUP_ID,
+          message_thread_id: Number(topicId)
+        }
+      );
+
+      const reopenRetry =
+        await copyMessageWithReplyFallback(
+          env.BOT_TOKEN,
+          {
+            chat_id: env.ADMIN_GROUP_ID,
+            message_thread_id:
+              Number(topicId),
+            from_chat_id:
+              String(message.chat.id),
+            message_id:
+              message.message_id,
+            disable_notification:
+              Boolean(
+                freshUser.is_blocked ||
+                freshUser.is_muted
+              )
+          },
+          replyParameters
+        );
+
+      copiedMessageId =
+        reopenRetry?.message_id || null;
+    } else if (!isTopicInvalidError(error)) {
       throw error;
-    }
+    } else {
+      console.error(
+        '访客话题已失效，准备重建：',
+        error?.message || error
+      );
 
-    console.error(
-      '访客话题已失效，准备重建：',
-      error?.message || error
-    );
-
-    await dbUserUpdate(
-      userId,
-      {
-        topic_id: null,
-        info_card_message_id: null,
-        topic_creating: false,
-        topic_lock_at: null
-      },
-      env
-    );
-
-    const refreshedUser =
-      await dbUserGetOrCreate(
+      await dbUserUpdate(
         userId,
+        {
+          topic_id: null,
+          info_card_message_id: null,
+          topic_creating: false,
+          topic_lock_at: null
+        },
         env
       );
 
-    const newTopicId =
-      await ensureUserTopic(
-        message,
-        refreshedUser,
-        env
+      const refreshedUser =
+        await dbUserGetOrCreate(
+          userId,
+          env
+        );
+
+      const newTopicId =
+        await ensureUserTopic(
+          message,
+          refreshedUser,
+          env
+        );
+
+      const newestUser =
+        await dbUserGetOrCreate(
+          userId,
+          env
+        );
+
+      if (!newestUser.info_card_message_id) {
+        await ensureUserInfoCard(
+          message,
+          newestUser,
+          newTopicId,
+          env
+        );
+      }
+
+      const retryCopyResult =
+        await copyMessageWithReplyFallback(
+        env.BOT_TOKEN,
+        {
+          chat_id: env.ADMIN_GROUP_ID,
+          message_thread_id:
+            Number(newTopicId),
+          from_chat_id:
+            String(message.chat.id),
+          message_id:
+            message.message_id,
+          disable_notification:
+            Boolean(
+              newestUser.is_blocked ||
+              newestUser.is_muted
+            )
+        },
+        replyParameters
       );
 
-    const newestUser =
-      await dbUserGetOrCreate(
-        userId,
-        env
-      );
+      copiedMessageId =
+        retryCopyResult?.message_id ||
+        null;
 
-    if (!newestUser.info_card_message_id) {
-      await ensureUserInfoCard(
-        message,
-        newestUser,
-        newTopicId,
-        env
-      );
+      topicId = newTopicId;
     }
-
-    const retryCopyResult =
-      await copyMessageWithReplyFallback(
-      env.BOT_TOKEN,
-      {
-        chat_id: env.ADMIN_GROUP_ID,
-        message_thread_id:
-          Number(newTopicId),
-        from_chat_id:
-          String(message.chat.id),
-        message_id:
-          message.message_id,
-        disable_notification:
-          Boolean(
-            newestUser.is_blocked ||
-            newestUser.is_muted
-          )
-      },
-      replyParameters
-    );
-
-    copiedMessageId =
-      retryCopyResult?.message_id ||
-      null;
-
-    topicId = newTopicId;
   }
 
   if (copiedMessageId) {
@@ -2918,19 +3046,24 @@ async function tombstoneTopicMessage(
           privateMessageId
         };
 
-        await dbMessageDataPut(
-          REACTION_MAP_USER,
-          `t:${topicMessageId}`,
-          { text: 'gone', date: now },
-          env
-        );
+        // 两行墓碑一次 batch 写完（与 storeMessagePair
+        // 同一口径）：分开写时第二写失败会留下半边墓碑，
+        // 已删消息的编辑会走回退路径借通知「复活」。
+        await env.TG_BOT_DB.batch([
+          messageDataPutStatement(
+            REACTION_MAP_USER,
+            `t:${topicMessageId}`,
+            { text: 'gone', date: now },
+            env
+          ),
 
-        await dbMessageDataPut(
-          REACTION_MAP_USER,
-          `p:${userId}:${privateMessageId}`,
-          { text: 'gone', date: now },
-          env
-        );
+          messageDataPutStatement(
+            REACTION_MAP_USER,
+            `p:${userId}:${privateMessageId}`,
+            { text: 'gone', date: now },
+            env
+          )
+        ]);
 
         const hintSpecs = [
           {
@@ -3241,13 +3374,25 @@ async function handleMessageReaction(
   const chat = reaction?.chat;
   const reactor = reaction?.user;
 
-  if (!chat || !reactor) {
+  if (!chat) {
+    return;
+  }
+
+  // 匿名管理员（以群/频道身份）的反应没有普通 user：
+  // user 是 GroupAnonymousBot（1087968824）或带
+  // actor_chat。在管理群里按管理员侧处理。
+  const isAnonymousAdminReaction =
+    Boolean(reaction?.actor_chat) ||
+    Number(reactor?.id || 0) === 1087968824;
+
+  if (!reactor && !isAnonymousAdminReaction) {
     return;
   }
 
   // 忽略机器人账号的反应：镜像动作本身会产生反应更新，
   // 不过滤会来回打转；其他机器人的反应也不转发。
-  if (reactor.is_bot) {
+  // （匿名管理员的 GroupAnonymousBot 除外，见上。）
+  if (reactor?.is_bot && !isAnonymousAdminReaction) {
     return;
   }
 
@@ -3256,10 +3401,30 @@ async function handleMessageReaction(
       reaction.new_reaction
     );
 
+  // 新反应里只有付费 emoji（⭐）时机器人没法镜像：
+  // 付费反应是叠加在普通反应之上的，整体跳过，
+  // 不要把之前镜像好的普通反应误清掉。（自定义 emoji
+  // 与普通 emoji 同槽替换，仍按镜像普通子集的老口径。）
+  const rawNewReactions = Array.isArray(
+    reaction.new_reaction
+  )
+    ? reaction.new_reaction
+    : [];
+
+  if (
+    rawNewReactions.length &&
+    !emojis.length &&
+    rawNewReactions.every(
+      (item) => item?.type === 'paid'
+    )
+  ) {
+    return;
+  }
+
   if (chat.type === 'private') {
     const userId = String(chat.id);
 
-    if (String(reactor.id) !== userId) {
+    if (!reactor || String(reactor.id) !== userId) {
       return;
     }
 
@@ -3301,16 +3466,18 @@ async function handleMessageReaction(
     String(chat.id) ===
     String(env.ADMIN_GROUP_ID)
   ) {
-    const reactorId =
-      String(reactor.id);
+    if (!isAnonymousAdminReaction) {
+      const reactorId =
+        String(reactor.id);
 
-    if (
-      !(await isAdminUser(
-        reactorId,
-        env
-      ))
-    ) {
-      return;
+      if (
+        !(await isAdminUser(
+          reactorId,
+          env
+        ))
+      ) {
+        return;
+      }
     }
 
     const stored =
@@ -3430,7 +3597,8 @@ async function showMainMenu(
   chatId,
   env,
   messageId = 0,
-  triggerMessageId = 0
+  triggerMessageId = 0,
+  origin = ''
 ) {
   const updateCache =
     await readUpdateCache(env);
@@ -3458,7 +3626,7 @@ ${versionLine}${pauseLine}
   const keyboard = [];
 
   const listOrigin = getPublicOrigin(
-    lastRequestOrigin,
+    origin,
     env
   );
 
@@ -3547,23 +3715,35 @@ ${versionLine}${pauseLine}
 
       let prevMenuId = 0;
       let prevCmdId = 0;
+      let trackTs = 0;
 
       const rawTrack = await dbConfigGet(trackKey, env);
 
       if (rawTrack) {
-        try {
-          const parsed = JSON.parse(rawTrack);
+        let parsedTrack = null;
 
+        try {
+          parsedTrack = JSON.parse(rawTrack);
+        } catch (_) {
+          parsedTrack = null;
+        }
+
+        if (typeof parsedTrack === 'number') {
+          // 旧格式：纯数字只记了菜单编号。注意
+          // JSON.parse('4242') 不抛错、直接返回数字，
+          // 必须在这里单独接住（放进 catch 永远走不到）。
+          prevMenuId = parsedTrack || 0;
+        } else if (parsedTrack) {
           prevMenuId =
-            parseInt(parsed?.m || '0', 10) || 0;
+            parseInt(parsedTrack?.m || '0', 10) || 0;
 
           prevCmdId =
-            parseInt(parsed?.c || '0', 10) || 0;
+            parseInt(parsedTrack?.c || '0', 10) || 0;
+
+          trackTs = Number(parsedTrack?.t) || 0;
 
           // 追踪超过保鲜期：里面的消息号已过 Telegram
           // 删除窗口、删不动了，直接作废，跳过删除尝试。
-          const trackTs = Number(parsed?.t) || 0;
-
           if (
             trackTs &&
             Date.now() - trackTs > MENU_TRACK_TTL_MS
@@ -3571,9 +3751,6 @@ ${versionLine}${pauseLine}
             prevMenuId = 0;
             prevCmdId = 0;
           }
-        } catch (_) {
-          // 旧格式：纯数字只记了菜单编号
-          prevMenuId = parseInt(rawTrack, 10) || 0;
         }
       }
 
@@ -3601,7 +3778,11 @@ ${versionLine}${pauseLine}
           JSON.stringify({
             m: menuMessageId,
             c: prevCmdId,
-            t: Date.now()
+            // 原地编辑不换消息号：时间戳保持消息号的
+            // 「出生时刻」，不要按渲染时刻刷新——否则
+            // 靠按钮导航的管理员命令号永远不过期、
+            // 记录也永远清不掉。旧记录没戳时补一个。
+            t: trackTs || Date.now()
           }),
           env
         );
@@ -3678,11 +3859,35 @@ async function handleStart(
   );
 }
 
+// 问答验证防爆破：连续答错达上限后锁定一段时间。
+// 问答是静态共享答案，没有次数限制时可被在线穷举。
+const QUIZ_MAX_ATTEMPTS = 5;
+const QUIZ_LOCK_MS = 30 * 60 * 1000;
+
 async function handleVerification(
   chatId,
   answer,
   env
 ) {
+  const lockKey = `quizlock:${chatId}`;
+  const lockRaw = await dbConfigGet(lockKey, env);
+
+  let lockState = null;
+
+  try {
+    lockState = lockRaw ? JSON.parse(lockRaw) : null;
+  } catch (_) {
+    lockState = null;
+  }
+
+  // 锁定中：静默拒绝（不回复、不写库），刷屏也烧不了额度。
+  if (
+    lockState &&
+    Number(lockState.until || 0) > Date.now()
+  ) {
+    return false;
+  }
+
   const expected = await getConfig(
     'verif_a',
     env,
@@ -3704,6 +3909,39 @@ async function handleVerification(
     expectedAnswers.includes(normalized);
 
   if (!isCorrect) {
+    const attempts =
+      Number(lockState?.n || 0) + 1;
+
+    if (attempts >= QUIZ_MAX_ATTEMPTS) {
+      await dbConfigPut(
+        lockKey,
+        JSON.stringify({
+          n: 0,
+          until: Date.now() + QUIZ_LOCK_MS
+        }),
+        env
+      );
+
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text:
+            '🚫 答错次数过多，验证已锁定 ' +
+            '30 分钟，请稍后再试。'
+        }
+      );
+
+      return false;
+    }
+
+    await dbConfigPut(
+      lockKey,
+      JSON.stringify({ n: attempts, until: 0 }),
+      env
+    );
+
     await telegramApi(
       env.BOT_TOKEN,
       'sendMessage',
@@ -3717,6 +3955,9 @@ async function handleVerification(
 
     return false;
   }
+
+  // 答对后清掉计数与锁定。
+  await dbConfigDelete(lockKey, env);
 
   // 先更新状态，再通知访客，避免访客快速发送消息时状态未保存。
   await dbUserUpdate(
@@ -3796,6 +4037,13 @@ function getPublicOrigin(requestOrigin, env) {
     .replace(/\/+$/, '');
 }
 
+// 链接签名密钥：优先用独立的 LINK_SECRET，未配置时回退
+// WEBHOOK_SECRET（保持旧行为）。两者解耦后，webhook 校验值
+// 泄露不再连带击穿全部签名链接（验证/通行证/三页）。
+function linkSecret(env) {
+  return env.LINK_SECRET || env.WEBHOOK_SECRET;
+}
+
 async function hmacSha256Hex(key, data) {
   const encoder = new TextEncoder();
 
@@ -3855,7 +4103,7 @@ async function buildVerifyUrl(
 
   const signature =
     await hmacSha256Hex(
-      env.WEBHOOK_SECRET,
+      linkSecret(env),
       testMode
         ? `tsverify-test:${userId}:${exp}`
         : `tsverify:${userId}:${exp}`
@@ -3900,7 +4148,7 @@ async function checkVerifySignature(
 
   const expected =
     await hmacSha256Hex(
-      env.WEBHOOK_SECRET,
+      linkSecret(env),
       testMode
         ? `tsverify-test:${uid}:${exp}`
         : `tsverify:${uid}:${exp}`
@@ -3915,7 +4163,7 @@ async function checkVerifySignature(
 
 async function buildPassUrl(origin, userId, nonce, exp, env) {
   const signature = await hmacSha256Hex(
-    env.WEBHOOK_SECRET,
+    linkSecret(env),
     `pass:${userId}:${exp}:${nonce}`
   );
 
@@ -3948,7 +4196,7 @@ async function checkPassSignature(userId, expRaw, nonce, signature, env) {
   }
 
   const expected = await hmacSha256Hex(
-    env.WEBHOOK_SECRET,
+    linkSecret(env),
     `pass:${uid}:${exp}:${String(nonce || '')}`
   );
 
@@ -4969,6 +5217,190 @@ async function handleBlockedKeyword(
   );
 }
 
+/* -------------------------------------------------------------------------- */
+/*                 转发失败通知与已验证访客限速（审计第四轮新增）                */
+/* -------------------------------------------------------------------------- */
+
+const RELAY_FAIL_NOTICE_MIN_MS = 10 * 60 * 1000;
+
+function isRightsError(error) {
+  const text = String(
+    error?.message || error
+  ).toLowerCase();
+
+  return (
+    text.includes('not enough rights') ||
+    text.includes('administrator rights') ||
+    text.includes('chat admin required') ||
+    text.includes('bot is not a member') ||
+    text.includes('bot was kicked')
+  );
+}
+
+// 转发失败不再静默：节流后往访客话题里留一行提醒；
+// 话题发不进去（群权限丢失等）时改走主管理员私聊兜底。
+async function notifyRelayFailure(
+  message,
+  user,
+  env,
+  error
+) {
+  const userId = String(message.from.id);
+
+  try {
+    const throttleKey = `copyfail:${userId}`;
+    const last = Number(
+      (await dbConfigGet(throttleKey, env)) || 0
+    );
+
+    if (
+      Date.now() - last <
+      RELAY_FAIL_NOTICE_MIN_MS
+    ) {
+      return;
+    }
+
+    await dbConfigPut(
+      throttleKey,
+      String(Date.now()),
+      env
+    );
+
+    if (isRightsError(error)) {
+      await notifyPrimaryAdmins(
+        env,
+        '⚠️ 机器人似乎已失去管理群的管理员权限，' +
+        '访客消息无法转发进话题，请检查群权限。'
+      );
+
+      return;
+    }
+
+    const fresh = await dbUserGet(userId, env);
+    const topicId =
+      fresh?.topic_id || user?.topic_id;
+
+    let delivered = false;
+
+    if (topicId) {
+      try {
+        await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: env.ADMIN_GROUP_ID,
+            message_thread_id: Number(topicId),
+            text:
+              '⚠️ 访客发来的一条消息未能转发到话题' +
+              '（内容可能受保护限制或接口异常），' +
+              '对方以为已发送成功，请留意。'
+          }
+        );
+
+        delivered = true;
+      } catch (_) {
+        delivered = false;
+      }
+    }
+
+    if (!delivered) {
+      await notifyPrimaryAdmins(
+        env,
+        `⚠️ 访客 ${userId} 的一条消息转发失败，` +
+        '未能送达话题。'
+      );
+    }
+  } catch (_) {
+    /* 通知失败不影响主流程 */
+  }
+}
+
+// 已验证访客转发限速（内存令牌桶，尽力而为）：
+// 挡住刷屏把 D1 写入与 Telegram 调用成倍放大烧穿
+// 免费额度；超速消息直接丢弃并节流提醒。
+const relayBuckets = new Map();
+const RELAY_BUCKET_CAPACITY = 30;
+const RELAY_BUCKET_REFILL_PER_SEC = 5;
+const RELAY_LIMIT_NOTICE_MIN_MS = 10 * 60 * 1000;
+
+function relayRateLimitAllow(userId) {
+  const now = Date.now();
+
+  let bucket = relayBuckets.get(userId);
+
+  if (!bucket) {
+    if (relayBuckets.size >= 1000) {
+      relayBuckets.delete(
+        relayBuckets.keys().next().value
+      );
+    }
+
+    bucket = {
+      tokens: RELAY_BUCKET_CAPACITY,
+      at: now,
+      noticedAt: 0
+    };
+
+    relayBuckets.set(userId, bucket);
+  }
+
+  const elapsedSec = (now - bucket.at) / 1000;
+
+  bucket.tokens = Math.min(
+    RELAY_BUCKET_CAPACITY,
+    bucket.tokens +
+      elapsedSec * RELAY_BUCKET_REFILL_PER_SEC
+  );
+
+  bucket.at = now;
+
+  if (bucket.tokens < 1) {
+    return false;
+  }
+
+  bucket.tokens -= 1;
+
+  return true;
+}
+
+async function notifyRelayRateLimited(user, env) {
+  const userId = String(user?.user_id || '');
+  const bucket = relayBuckets.get(userId);
+  const now = Date.now();
+
+  if (
+    bucket &&
+    now - bucket.noticedAt <
+      RELAY_LIMIT_NOTICE_MIN_MS
+  ) {
+    return;
+  }
+
+  if (bucket) {
+    bucket.noticedAt = now;
+  }
+
+  if (!user?.topic_id) {
+    return;
+  }
+
+  try {
+    await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: env.ADMIN_GROUP_ID,
+        message_thread_id: Number(user.topic_id),
+        text:
+          '⚠️ 该访客发送消息过于频繁，' +
+          '超出部分已被限流丢弃。'
+      }
+    );
+  } catch (_) {
+    /* 提醒失败不影响限速本身 */
+  }
+}
+
 async function handlePrivateMessage(
   message,
   env,
@@ -4997,7 +5429,7 @@ async function handlePrivateMessage(
     commandText === '/help'
   ) {
     if (isPrimary) {
-      await showMainMenu(chatId, env, 0, message.message_id || 0);
+      await showMainMenu(chatId, env, 0, message.message_id || 0, origin);
       return;
     }
 
@@ -5372,11 +5804,31 @@ async function handlePrivateMessage(
     );
   }
 
-  await relayUserMessageToTopic(
-    message,
-    user,
-    env
-  );
+  if (!relayRateLimitAllow(userId)) {
+    await notifyRelayRateLimited(user, env);
+
+    return;
+  }
+
+  try {
+    await relayUserMessageToTopic(
+      message,
+      user,
+      env
+    );
+  } catch (error) {
+    console.error(
+      '转发访客消息失败：',
+      error?.message || error
+    );
+
+    await notifyRelayFailure(
+      message,
+      user,
+      env,
+      error
+    );
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -5386,7 +5838,7 @@ function parseAdminCommand(text) {
   const value = String(text || '').trim();
 
   const match = value.match(
-    /^\/([a-zA-Z_]+)(?:@\w+)?(?:\s+([\s\S]+))?$/
+    /^\/([a-zA-Z_]+)(?:@(\w+))?(?:\s+([\s\S]+))?$/
   );
 
   if (!match) {
@@ -5395,8 +5847,45 @@ function parseAdminCommand(text) {
 
   return {
     command: match[1].toLowerCase(),
-    argument: match[2]?.trim() || ''
+    suffix: match[2] || '',
+    argument: match[3]?.trim() || ''
   };
+}
+
+// 本机器人用户名（getMe 拉一次后缓存进 config）：
+// 用于识别「/命令@别的机器人」——那是发给别人的，
+// 本机器人应完全忽略，而不是照常执行或吞掉。
+async function getBotUsername(env) {
+  const cached = await dbConfigGet(
+    'sys:bot-username',
+    env
+  );
+
+  if (cached) {
+    return cached;
+  }
+
+  try {
+    const me = await telegramApi(
+      env.BOT_TOKEN,
+      'getMe',
+      {}
+    );
+
+    const name = String(me?.username || '');
+
+    if (name) {
+      await dbConfigPut(
+        'sys:bot-username',
+        name,
+        env
+      );
+    }
+
+    return name;
+  } catch (_) {
+    return '';
+  }
 }
 
 async function resolveTopicUserId(
@@ -5465,6 +5954,24 @@ async function sendEphemeralTopicNotice(
       ? Number(env.EPHEMERAL_NOTICE_MS)
       : 5000;
 
+  // 落一条待删记账：定时删除挂在请求上下文上，
+  // 万一上下文被回收没删成，数据库清扫会按记账
+  // 补删（见 sweepEphemeralNotices）。
+  const markerKey = `ephem:${noticeId}`;
+
+  try {
+    await dbConfigPut(
+      markerKey,
+      JSON.stringify({
+        c: String(env.ADMIN_GROUP_ID),
+        at: Date.now() + delayMs
+      }),
+      env
+    );
+  } catch (_) {
+    /* 记账失败不影响短暂通知本身 */
+  }
+
   const task = (async () => {
     await sleep(delayMs);
 
@@ -5473,6 +5980,8 @@ async function sendEphemeralTopicNotice(
       env.ADMIN_GROUP_ID,
       noticeId
     );
+
+    await dbConfigDelete(markerKey, env);
   })();
 
   if (ctx?.waitUntil) {
@@ -5689,7 +6198,7 @@ async function handleAdminCommand(
         env
       );
 
-      return true;
+      return 'keep';
     }
 
     const target =
@@ -5751,7 +6260,7 @@ async function handleAdminCommand(
         env
       );
 
-      return true;
+      return 'keep';
     }
 
     await dbUserUpdate(
@@ -5980,6 +6489,18 @@ async function handleAdminCommand(
     return true;
   }
   if (parsed.command === 'clear') {
+    // 整段清空连访客私聊副本一并删除、不可恢复，
+    // 与服务熔断同口径：仅主管理员可操作。
+    if (!isPrimaryAdmin(senderId, env)) {
+      await sendTopicNotice(
+        message,
+        '⛔ 整段对话清空仅主管理员可操作。',
+        env
+      );
+
+      return true;
+    }
+
     const userId =
       await resolveTopicUserId(
         message,
@@ -6195,6 +6716,12 @@ async function handleAdminReply(
     return;
   }
 
+  // 以频道身份发帖等场景下消息可能没有 from：
+  // 无从核验发送者身份，直接忽略（避免后面解引用抛错）。
+  if (!message.from) {
+    return;
+  }
+
   // 话题服务消息（关闭/重开/改名/置顶通知等）不是管理员的
   // 回复内容，且 Telegram 不允许复制，直接忽略，
   // 避免误报「转发失败」。
@@ -6224,6 +6751,24 @@ if (
   message.text &&
   message.text.trim().startsWith('/')
 ) {
+  // 命令带了 @ 后缀且不是本机器人：是发给别的机器人的，
+  // 完全忽略（不执行、不提示、不撤回、也不转发给访客）。
+  const parsedForTarget =
+    parseAdminCommand(message.text);
+
+  if (parsedForTarget?.suffix) {
+    const botUsername =
+      await getBotUsername(env);
+
+    if (
+      botUsername &&
+      parsedForTarget.suffix.toLowerCase() !==
+        botUsername.toLowerCase()
+    ) {
+      return;
+    }
+  }
+
   const handled =
     await handleAdminCommand(
       message,
@@ -6235,11 +6780,16 @@ if (
     // 命令已处理：把管理员发出的命令消息本身也撤回，
     // 话题里只留短暂显示的回执、不留命令原文。
     // （/clear 分支已先行删除，这里重复删会静默跳过。）
-    await quietDeleteMessage(
-      env,
-      env.ADMIN_GROUP_ID,
-      message.message_id
-    );
+    // 例外：handled === 'keep' 表示处理未成功且命令原文
+    // 本身是内容载体（如 /note 保存失败），保留原文，
+    // 管理员还能照着改了重发。
+    if (handled !== 'keep') {
+      await quietDeleteMessage(
+        env,
+        env.ADMIN_GROUP_ID,
+        message.message_id
+      );
+    }
 
     return;
   }
@@ -7013,7 +7563,8 @@ async function handleUserCardCallback(
 
 async function handleCallbackQuery(
   callbackQuery,
-  env
+  env,
+  origin = ''
 ) {
   if (!callbackQuery?.from?.id) {
     return;
@@ -7048,7 +7599,9 @@ async function handleCallbackQuery(
     await showMainMenu(
       String(callbackQuery.from.id),
       env,
-      callbackQuery.message?.message_id || 0
+      callbackQuery.message?.message_id || 0,
+      0,
+      origin
     );
 
     return;
@@ -7070,7 +7623,8 @@ async function handleCallbackQuery(
   if (data.startsWith('pause:')) {
     await handlePauseCallback(
       callbackQuery,
-      env
+      env,
+      origin
     );
 
     return;
@@ -7165,6 +7719,26 @@ async function noteBotBlocked(userId, env) {
       String(sent.message_id),
       env
     );
+
+    // 竞态收尾：记账期间对方若已解除拉黑（解除侧先跑完、
+    // 没读到这条记账），这条 🚫 已不是最新状态——
+    // 自行删掉并清记账，免得话题里留下一条永远
+    // 没人删的过期拉黑提醒（拉黑标记已被解除侧删走
+    // 是判据：标记还在说明仍处于拉黑状态）。
+    if (
+      (await dbConfigGet(flagKey, env)) !== '1'
+    ) {
+      await quietDeleteMessage(
+        env,
+        env.ADMIN_GROUP_ID,
+        sent.message_id
+      );
+
+      await dbConfigDelete(
+        `blocknotice:${userId}`,
+        env
+      );
+    }
   }
 }
 
@@ -7187,6 +7761,13 @@ async function noteBotUnblocked(
     await dbUserGetOrCreate(userId, env);
 
   if (user.is_blocked || !user.topic_id) {
+    // 不发 ✅ 的场合记账也没有意义了，一并清掉：
+    // 残留的旧消息号日后可能被当成删除指针误用。
+    await dbConfigDelete(
+      `blocknotice:${userId}`,
+      env
+    );
+
     return;
   }
 
@@ -7219,7 +7800,10 @@ async function noteBotUnblocked(
       env
     );
 
-    if (stored) {
+    if (
+      stored &&
+      (await dbConfigGet(flagKey, env)) !== '1'
+    ) {
       await quietDeleteMessage(
         env,
         env.ADMIN_GROUP_ID,
@@ -7289,10 +7873,15 @@ async function collectConversationMessageIds(
 
   const privateIds = new Set();
   const topicIds = new Set();
+  const pairKeys = [];
 
   for (const row of pairRows.results || []) {
     const mid = String(row.message_id || '');
     const text = String(row.text || '');
+
+    // 配对行（含墓碑）的键先记下：清空收尾只删这份
+    // 快照里的行，清空期间新到的消息不在快照内。
+    pairKeys.push(mid);
 
     if (text === 'gone') {
       continue;
@@ -7323,27 +7912,51 @@ async function collectConversationMessageIds(
     `hint:p:${userId}:%`
   ).all();
 
+  const hintKeys = [];
+
   for (const row of hintRows.results || []) {
+    hintKeys.push(String(row.message_id || ''));
+
     const hid = Number(row.text);
 
     if (hid) topicIds.add(hid);
   }
 
-  for (const topicId of [...topicIds]) {
-    const hint = await dbMessageDataGet(
-      REACTION_MAP_USER,
-      `hint:t:${topicId}`,
-      env
+  // hint:t: 改按 100 条分块 IN 查询：逐条点读在长对话
+  // 下要串行上千次；顺手把键记进 hintKeys 供收尾删除。
+  const topicIdList = [...topicIds];
+
+  for (let i = 0; i < topicIdList.length; i += 100) {
+    const chunk = topicIdList.slice(i, i + 100);
+    const keys = chunk.map(
+      (topicId) => `hint:t:${topicId}`
     );
 
-    const hid = Number(hint?.text);
+    hintKeys.push(...keys);
 
-    if (hid) privateIds.add(hid);
+    const placeholders = keys
+      .map(() => '?')
+      .join(', ');
+
+    const hintTRows = await env.TG_BOT_DB.prepare(
+      'SELECT message_id, text FROM messages ' +
+      'WHERE user_id = ? AND message_id IN (' +
+      placeholders +
+      ')'
+    ).bind(REACTION_MAP_USER, ...keys).all();
+
+    for (const row of hintTRows.results || []) {
+      const hid = Number(row.text);
+
+      if (hid) privateIds.add(hid);
+    }
   }
 
   return {
     privateIds: [...privateIds],
-    topicIds: [...topicIds]
+    topicIds: [...topicIds],
+    pairKeys,
+    hintKeys
   };
 }
 
@@ -7409,7 +8022,7 @@ async function wipeConversationCopies(
   env,
   includeTopicContents
 ) {
-  const { privateIds, topicIds } =
+  const { privateIds, topicIds, pairKeys, hintKeys } =
     await collectConversationMessageIds(
       userId,
       env
@@ -7431,24 +8044,22 @@ async function wipeConversationCopies(
     );
   }
 
-  await env.TG_BOT_DB.prepare(
-    'DELETE FROM messages WHERE user_id = ? ' +
-    'AND (message_id LIKE ? ' +
-    'OR (message_id LIKE ? AND text LIKE ?) ' +
-    'OR message_id LIKE ?)'
-  ).bind(
-    REACTION_MAP_USER,
-    `p:${userId}:%`,
-    't:%',
-    `${userId}:%`,
-    `hint:p:${userId}:%`
-  ).run();
+  // 收尾只删收集快照里的配对/提示行（按 100 条分块
+  // batch）：此前按前缀无条件删，清空期间新到的消息
+  // 配对会被误扫、副本成孤儿；快照之外的行一律不碰。
+  const recordKeys = [...pairKeys, ...hintKeys];
 
-  for (const topicId of topicIds) {
-    await dbMessageDataDelete(
-      REACTION_MAP_USER,
-      `hint:t:${topicId}`,
-      env
+  for (let i = 0; i < recordKeys.length; i += 100) {
+    const chunk = recordKeys.slice(i, i + 100);
+
+    await env.TG_BOT_DB.batch(
+      chunk.map((key) =>
+        messageDataDeleteStatement(
+          REACTION_MAP_USER,
+          key,
+          env
+        )
+      )
     );
   }
 
@@ -7468,6 +8079,17 @@ async function handleClearCallback(
   const clickerId = String(
     callbackQuery.from?.id || ''
   );
+
+  if (!/^\d{1,20}$/.test(userId)) {
+    await answerCallback(
+      callbackQuery.id,
+      env,
+      '参数错误。',
+      true
+    );
+
+    return;
+  }
 
   if (
     !userId ||
@@ -7515,8 +8137,33 @@ async function handleClearCallback(
     return;
   }
 
+  // 执行侧再验一次主管理员（发命令时验过，
+  // 点确认的未必是同一人）。
+  if (!isPrimaryAdmin(clickerId, env)) {
+    await answerCallback(
+      callbackQuery.id,
+      env,
+      '整段对话清空仅主管理员可操作。',
+      true
+    );
+
+    return;
+  }
+
+  // 只读校验：访客记录已被删时不要先把空行建回来。
   const target =
-    await dbUserGetOrCreate(userId, env);
+    await dbUserGet(userId, env);
+
+  if (!target) {
+    await answerCallback(
+      callbackQuery.id,
+      env,
+      '访客记录已不存在。',
+      true
+    );
+
+    return;
+  }
 
   if (
     !target.topic_id ||
@@ -7526,6 +8173,28 @@ async function handleClearCallback(
       callbackQuery.id,
       env,
       '该话题已不属于这位访客。',
+      true
+    );
+
+    return;
+  }
+
+  // 防重复执行：拿确认消息编号做原子占用——同一条
+  // 确认被点两次（双击、并发回调）时只有第一个占得上，
+  // 后来的直接拒绝，避免两遍清空互相覆盖计数报告、
+  // 白烧调用。占用不释放：新一条 /clear 的确认编号
+  // 不同，照常能占上、正常执行。
+  const claimWon = await dbConfigClaim(
+    `clearrun:${userId}`,
+    `m:${msg.message_id || 0}`,
+    env
+  );
+
+  if (!claimWon) {
+    await answerCallback(
+      callbackQuery.id,
+      env,
+      '这条确认已在执行或已执行过，请勿重复点击。',
       true
     );
 
@@ -7594,6 +8263,27 @@ async function purgeManagedUser(
   // 连带作废未用通行证（删记录并删证消息），防删档后凭旧证复活。
   await voidUserPass(env, userId);
 
+  // 拉黑提醒记账一并清理：话题还在时先删那条 🚫，
+  // 再删记账行，免得残留编号日后被误当删除指针。
+  const staleBlockNotice =
+    await dbConfigGet(
+      `blocknotice:${userId}`,
+      env
+    );
+
+  if (staleBlockNotice && user.topic_id) {
+    await quietDeleteMessage(
+      env,
+      env.ADMIN_GROUP_ID,
+      staleBlockNotice
+    );
+  }
+
+  await dbConfigDelete(
+    `blocknotice:${userId}`,
+    env
+  );
+
   await env.TG_BOT_DB.batch([
     env.TG_BOT_DB.prepare(
       'DELETE FROM messages WHERE user_id = ?'
@@ -7643,7 +8333,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.2.1';
+const BOT_VERSION = 'v1.2.2';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -7890,7 +8580,8 @@ function describeUpdateState(cache) {
 
 async function handlePauseCallback(
   callbackQuery,
-  env
+  env,
+  origin = ''
 ) {
   const senderId = String(callbackQuery.from.id);
   const callbackId = callbackQuery.id;
@@ -7988,7 +8679,7 @@ async function handlePauseCallback(
       `⏸ 已暂停，${describePauseRemaining(state)}`
     );
 
-    await showMainMenu(senderId, env, messageId);
+    await showMainMenu(senderId, env, messageId, 0, origin);
 
     return;
   }
@@ -8002,7 +8693,7 @@ async function handlePauseCallback(
       '▶️ 已恢复服务'
     );
 
-    await showMainMenu(senderId, env, messageId);
+    await showMainMenu(senderId, env, messageId, 0, origin);
 
     return;
   }
@@ -8110,7 +8801,20 @@ async function handleUpdateCheckCallback(
 
 const USERLIST_LINK_TTL_MS = 30 * 60 * 1000;
 
-let lastRequestOrigin = '';
+// 签名链接按用途分权：访客列表（usrlist）/ 网页管理台（panel）/
+// 新手引导（guide）三套签名互不通用——只读性质的引导链接
+// 不再等于全权管理凭据，列表链接也改不了配置。
+function panelScopeForPath(path) {
+  if (path === '/panel') {
+    return 'panel';
+  }
+
+  if (path === '/guide') {
+    return 'guide';
+  }
+
+  return 'usrlist';
+}
 
 async function buildSignedPanelUrl(
   origin,
@@ -8121,8 +8825,8 @@ async function buildSignedPanelUrl(
   const exp = Date.now() + USERLIST_LINK_TTL_MS;
 
   const signature = await hmacSha256Hex(
-    env.WEBHOOK_SECRET,
-    `usrlist:${adminId}:${exp}`
+    linkSecret(env),
+    `${panelScopeForPath(path)}:${adminId}:${exp}`
   );
 
   const params = new URLSearchParams({
@@ -8152,7 +8856,13 @@ async function buildGuideUrl(origin, adminId, env) {
   );
 }
 
-async function checkUserListAuth(uid, expRaw, signature, env) {
+async function checkUserListAuth(
+  uid,
+  expRaw,
+  signature,
+  env,
+  scope = 'usrlist'
+) {
   const id = String(uid || '');
 
   if (!/^\d{1,20}$/.test(id)) {
@@ -8171,8 +8881,8 @@ async function checkUserListAuth(uid, expRaw, signature, env) {
   }
 
   const expected = await hmacSha256Hex(
-    env.WEBHOOK_SECRET,
-    `usrlist:${id}:${exp}`
+    linkSecret(env),
+    `${scope}:${id}:${exp}`
   );
 
   if (
@@ -8191,14 +8901,19 @@ async function checkUserListAuth(uid, expRaw, signature, env) {
   return id;
 }
 
-async function panelQueryAdminId(request, env) {
+async function panelQueryAdminId(
+  request,
+  env,
+  scope = 'usrlist'
+) {
   const url = new URL(request.url);
 
   return checkUserListAuth(
     url.searchParams.get('u'),
     url.searchParams.get('e'),
     url.searchParams.get('s'),
-    env
+    env,
+    scope
   );
 }
 
@@ -8206,10 +8921,11 @@ async function signedPageResponse(
   request,
   env,
   builder,
-  expiredText
+  expiredText,
+  scope = 'usrlist'
 ) {
   const adminId =
-    await panelQueryAdminId(request, env);
+    await panelQueryAdminId(request, env, scope);
 
   if (!adminId) {
     return new Response(
@@ -8540,7 +9256,8 @@ async function handlePanelPage(request, env) {
     request,
     env,
     buildPanelPage,
-    '链接无效或已过期，请回到机器人主菜单重新打开网页管理台。'
+    '链接无效或已过期，请回到机器人主菜单重新打开网页管理台。',
+    'panel'
   );
 }
 
@@ -8549,7 +9266,8 @@ async function handleGuidePage(request, env) {
     request,
     env,
     buildGuidePage,
-    '链接无效或已过期，请回到机器人主菜单重新打开新手引导。'
+    '链接无效或已过期，请回到机器人主菜单重新打开新手引导。',
+    'guide'
   );
 }
 
@@ -8631,7 +9349,7 @@ function buildGuidePage() {
     <p>验证是用来挡垃圾机器人和广告号的：没通过验证的人，发什么都不会转进群里。</p>
     <ul>
       <li><b class=\"k\">Turnstile 小程序验证（推荐）：</b>访客点「开始验证」按钮，弹出一个小页面自动完成人机校验，几秒通过，体验最顺。</li>
-      <li><b class=\"k\">静态问答验证：</b>你出一道题，访客答对才放行；答案可以准备多个，用竖线 <code>|</code> 分隔，答中任意一个都算对。</li>
+      <li><b class=\"k\">静态问答验证：</b>你出一道题，访客答对才放行；答案可以准备多个，用竖线 <code>|</code> 分隔，答中任意一个都算对。连着答错 5 次会被锁定 30 分钟（防有人对着答案穷举），锁定期间他发什么都不会有回应，过后自动解锁。</li>
       <li><b class=\"k\">在哪里切换：</b>网页管理台 → 基础配置 → 验证方式。选了 Turnstile 后，问题和答案两项会自动隐藏；如果还没配好 Turnstile 密钥，机器人会自动用问答模式兜底，不会把人卡死。</li>
       <li><b class=\"k\">让某人重新验证：</b>打开他的话题，发送 <code>/reverify</code>，他下一次发消息前要重新过一遍验证。</li>
       <li><b class=\"k\">自己先试一遍：</b>私聊发送 <code>/testverify</code> 会拿到一个测试验证链接，点开能看到访客眼中的验证页长什么样；测试模式只是看看样子，不会真的放行或记录任何人。</li>
@@ -8647,10 +9365,11 @@ function buildGuidePage() {
       <li><b class=\"k\">引用回复会跟着走：</b>你在话题里引用某条消息再回复，访客那边看到的也是引用着他原话的回复；访客引用着回复你时同理，连他框选一小段文字的「部分引用」都会原样带过去。</li>
       <li><b class=\"k\">改错字会同步：</b>直接编辑你已发送的消息，对方那边会同步改好，旁边出现一行「✏️ 对方修改了这条消息」的小提示。Telegram 不给机器人提供官方的「已编辑」标记，这行提示就是补这个用的；访客编辑他的消息时，你这边也一样。</li>
       <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。注意：访客私聊那边的原消息只能删 48 小时以内的，超了删不掉时会在话题里留一行说明。</li>
-      <li><b class=\"k\">整段对话清空：</b>在话题里发 <code>/clear</code> 并点确认，会把这个话题里的转发副本和访客私聊里的聊天副本成批删掉，话题本身保留、之后还能接着聊；48 小时前的私聊消息删不掉，清完会在话题里报告删了多少、多少删不掉。</li>
+      <li><b class=\"k\">整段对话清空：</b>在话题里发 <code>/clear</code> 并点确认，会把这个话题里的转发副本和访客私聊里的聊天副本成批删掉，话题本身保留、之后还能接着聊；48 小时前的私聊消息删不掉，清完会在话题里报告删了多少、多少删不掉。这个操作只有主管理员能做，协管员发命令或点确认都会被拦下。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
       <li><b class=\"k\">拉黑有提醒：</b>访客把机器人拉黑时，他的话题里会出现 🚫 提醒；他取消拉黑时有 ✅ 提醒，不用你去猜他还在不在；发出 ✅ 提醒的同时，之前那条 🚫 提醒会被一并删掉，话题里只留最新状态。</li>
-      <li><b class=\"k\">命令回执不留痕：</b>你在话题里发出的命令消息，会在处理后立即被撤回；/note 的查看与保存、/notedelete、/reverify、/ban、/unban、/card 重建、话题里 /pause 与 /resume 的结果提示，还有打错命令时的「未识别的命令」提示，都是短暂显示，约 5 秒后自动删除，话题里不会堆积这类回执。</li>
+      <li><b class=\"k\">转发失败有提醒：</b>极少数消息（比如带内容保护的内容）机器人复制不了、转不进话题时，会在话题里留一行 ⚠️ 提醒你留意（对方还以为发送成功了）；要是在群里手动关闭了某个话题，访客再发消息时机器人会先把话题重新打开再投递，不会另建新话题；访客短时间内发得太频繁时，超出部分会被限流丢弃，并在话题里提醒一次。</li>
+      <li><b class=\"k\">命令回执不留痕：</b>你在话题里发出的命令消息，会在处理后立即被撤回；/note 的查看与保存、/notedelete、/reverify、/ban、/unban、/card 重建、话题里 /pause 与 /resume 的结果提示，还有打错命令时的「未识别的命令」提示，都是短暂显示，约 5 秒后自动删除，话题里不会堆积这类回执。例外：/note 保存失败（比如备注超长）时，命令原文会保留下来，方便你照着改短了重发。</li>
       <li><b class=\"k\">被轰炸时先开启服务熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客新发的消息会被机器人当场删除、不补送——消息发出去就消失，就是还在暂停的信号；对熔断前已送达消息的编辑和反应照常同步到话题副本，两边记录保持一致；开启服务熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息；恢复服务时，那条「请稍后再试」会自动改成「✅ 服务已恢复」，访客一看便知。到期自动恢复（恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的），也可随时 <code>/resume</code> 提前恢复。</li>
     </ul>
   </section>
@@ -9419,7 +10138,11 @@ function validateScalarConfig(key, rawValue) {
   return { error: '不允许修改的配置项' };
 }
 
-async function readPanelPostBody(request, env) {
+async function readPanelPostBody(
+  request,
+  env,
+  scope = 'usrlist'
+) {
   if (
     Number(
       request.headers.get('content-length') || 0
@@ -9450,7 +10173,8 @@ async function readPanelPostBody(request, env) {
     body?.u,
     body?.e,
     body?.s,
-    env
+    env,
+    scope
   );
 
   if (!adminId) {
@@ -9467,7 +10191,7 @@ async function readPanelPostBody(request, env) {
 
 async function handleConfigApi(request, env) {
   const adminId =
-    await panelQueryAdminId(request, env);
+    await panelQueryAdminId(request, env, 'panel');
 
   if (!adminId) {
     return Response.json(
@@ -9531,7 +10255,7 @@ async function handleConfigApi(request, env) {
 }
 
 async function handleConfigSet(request, env) {
-  const parsed = await readPanelPostBody(request, env);
+  const parsed = await readPanelPostBody(request, env, 'panel');
 
   if (parsed.response) {
     return parsed.response;
@@ -9558,7 +10282,7 @@ async function handleConfigSet(request, env) {
 }
 
 async function handleConfigToggle(request, env) {
-  const parsed = await readPanelPostBody(request, env);
+  const parsed = await readPanelPostBody(request, env, 'panel');
 
   if (parsed.response) {
     return parsed.response;
@@ -9603,7 +10327,7 @@ async function handleConfigToggle(request, env) {
 }
 
 async function handleConfigPause(request, env) {
-  const parsed = await readPanelPostBody(request, env);
+  const parsed = await readPanelPostBody(request, env, 'panel');
 
   if (parsed.response) {
     return parsed.response;
@@ -9657,7 +10381,7 @@ async function handleConfigPause(request, env) {
 }
 
 async function handleConfigList(request, env) {
-  const parsed = await readPanelPostBody(request, env);
+  const parsed = await readPanelPostBody(request, env, 'panel');
 
   if (parsed.response) {
     return parsed.response;
@@ -11039,7 +11763,8 @@ async function handleUpdate(
   if (update.callback_query) {
     await handleCallbackQuery(
       update.callback_query,
-      env
+      env,
+      origin
     );
   }
 }
@@ -11076,8 +11801,6 @@ export default {
     }
 
     const requestUrl = new URL(request.url);
-
-    lastRequestOrigin = requestUrl.origin;
 
     if (
       request.method === 'GET' &&

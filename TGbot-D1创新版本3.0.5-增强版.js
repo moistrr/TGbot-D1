@@ -22,8 +22,8 @@
  *   的人会新建话题；reverify_ttl_days（温和版）到期只把已验证访客
  *   改回待验证，档案、备注与话题都保留，回来重验后还在原话题。
  * 功能清单（与仓库 README-增强版 条目对应）
- * Turnstile / 静态问答 / 顺序点击多验证方式与回退；管理员一次性通行证（网页访客列表发放，机器人私聊送达，30 分钟有效、凭 Telegram 身份确认、用后即焚，救济怎么也过不了验证的访客）；验证提示、通行证与成功回执都会记录消息 ID 并自动清理：通过验证即撤回提示与未用通行证，成功回执在首条消息转发成功后撤回，过期通行证在访客下次互动时清扫，状态类消息只保留最新一条；访客列表会显示待验证访客的通行证状态（已发证剩余分钟），发证动作返回到期时间并即时刷新行内徽标；第三轮三路审计修复：删人/重置/超时清理连带作废通行证、Turnstile 确认补封禁检查、删证与发证改原子条件操作、熔断到期通知与熔断回复改原子占用、验证提示加 3 分钟节流、反应镜像补访客状态检查、初始化错误不外泄细节、节流标记在验证成功/删人/超时清理时一并清掉；引用转发（含部分引用，三级降级）；
- * 反应双向同步；原地编辑同步 + 回复关联的 ✏️ 提示（Bot API 编辑
+ * Turnstile / 静态问答 / 顺序点击多验证方式与回退；管理员一次性通行证（网页访客列表发放，机器人私聊送达，30 分钟有效、凭 Telegram 身份确认、用后即焚，救济怎么也过不了验证的访客）；验证提示、通行证与成功回执都会记录消息 ID 并自动清理：通过验证即撤回提示与未用通行证，成功回执在访客发出首条消息时撤回（转发成功后亦有兜底清理，记账失败则回执自删不留孤儿），过期通行证在访客下次互动时清扫，状态类消息只保留最新一条；访客列表会显示待验证访客的通行证状态（已发证剩余分钟），发证动作返回到期时间并即时刷新行内徽标；第三轮三路审计修复：删人/重置/超时清理连带作废通行证、Turnstile 确认补封禁检查、删证与发证改原子条件操作、熔断到期通知与熔断回复改原子占用、验证提示加 3 分钟节流、反应镜像补访客状态检查、初始化错误不外泄细节、节流标记在验证成功/删人/超时清理时一并清掉；引用转发（含部分引用，三级降级）；
+ * 反应双向同步；原地编辑同步 + 回复关联的「✍🏼已编辑」提示行（带「系统提示」按钮防伪造，Bot API 编辑
  * 无原生标记）；拉黑 / 取消拉黑提醒（my_chat_member + 403 兜底、
  * 标记去重）；/delete 按配对连带删除私聊原消息（原生删除无机器人
  * 事件、无法同步，属平台限制）；管理员备注 /note 同步到话题名
@@ -32,7 +32,7 @@
  * 台（原按钮菜单已下线，旧按钮回迁移提示）；新手引导 /guide；
  * 自动检查更新；服务熔断 /pause /resume（手动触发，闸门在去重之
  * 前；到期惰性恢复——由到期后第一条更新触发解除并通知，属刻意
- * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数；命令回执类话题通知（备注查看/保存/删除、重置验证、封禁/解封结果、资料卡重建、话题内熔断开启/恢复/状态结果、未识别命令）改为短暂显示，发出约 5 秒后自动删除；访客解除拉黑、发出 ✅ 提醒时，之前那条 🚫 拉黑提醒会被一并删掉（编号记在 blocknotice:<访客>）；话题里管理员发出的命令消息在处理后一并撤回（未识别的命令同样），只短暂留回执、不留命令原文；主菜单追踪记录带写入时间戳，超过 48 小时（记录里的消息号已过 Telegram 删除窗口）会被数据库清扫整行删掉，读到过期记录时也直接跳过注定失败的删除。第四轮审计修复：问答验证答错 5 次锁定 30 分钟防穷举；三页签名链接按用途分权（引导/列表/管理台互不通用），签名密钥可改用独立的 LINK_SECRET 与 webhook 校验值解耦（未配置时回退 WEBHOOK_SECRET）；整段对话清空仅主管理员可操作、确认防重复执行、访客记录已删时点确认不再把空档案建回来，且清空只删开始那一刻收集到的快照记录（清空期间新到的消息配对不受影响），提示行改分块批量查询与批量删除；拉黑提醒记账竞态收尾，删档与超时清理一并清记账；主菜单追踪清扫按值条件删防误删新鲜记录、原地编辑不再刷新追踪时间戳（时间戳只记消息号的出生时刻）、旧格式纯数字追踪恢复解析；话题被手动关闭时先重开原话题再投递、不再误判失效重建；转发失败（内容受保护等）会在话题里提醒、群权限丢失时改走主管理员私聊告警；已验证访客发送过频会被限流丢弃并提醒；反应同步补匿名管理员处理，付费/自定义 emoji 不再误清已镜像的普通反应；短暂通知落 ephem 记账，定时删除没赶上时由数据库清扫补删；菜单签名链接的来源地址改为随请求传递（去掉可被任意请求覆盖的全局变量）；以频道身份发帖等没有 from 的消息直接忽略、不再抛错；命令 @ 的机器人名不是本机器人时完全忽略；/note 保存失败时保留命令原文便于改了重发。定制化扩展：管理台「基础配置」含参数与开关（转发限流强度、通行证/验证链接有效期、问答锁定次数与时长、命令回执停留秒数可调，均带范围校验；编辑提示、反应同步、转发失败提醒、拉黑提醒四个总开关），另有「文案与呈现」（验证成功/答错、熔断恢复、拉黑/解封五句文案可改；话题名四种样式；主菜单五个按钮逐个显隐；访客列表默认排序与每页条数存服务端配置）；按访客例外：信任标记 is_trusted（列表/资料卡设置即置已验证并按验证成功收尾，闸门处对未验证的信任访客自动放行，重置验证与 /reverify 连带撤销，超时清理豁免，资料卡按钮仅主管理员）与放行标记 relay_exempt（免转发限流与类型过滤，关键词封禁照常），列表行带徽标与切换按钮，/api/users 附 uiDefaults 供列表页套用默认排序与页大小。
+ * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数；命令回执类话题通知（备注查看/保存/删除、重置验证、封禁/解封结果、资料卡重建、话题内熔断开启/恢复/状态结果、未识别命令）改为短暂显示，发出约 5 秒后自动删除；访客解除拉黑、发出 ✅ 提醒时，之前那条 🚫 拉黑提醒会被一并删掉（编号记在 blocknotice:<访客>）；话题里管理员发出的命令消息在处理后一并撤回（未识别的命令同样），只短暂留回执、不留命令原文；主菜单追踪记录带写入时间戳，超过 48 小时（记录里的消息号已过 Telegram 删除窗口）会被数据库清扫整行删掉，读到过期记录时也直接跳过注定失败的删除。第四轮审计修复：问答验证答错 5 次锁定 30 分钟防穷举；三页签名链接按用途分权（引导/列表/管理台互不通用），签名密钥可改用独立的 LINK_SECRET 与 webhook 校验值解耦（未配置时回退 WEBHOOK_SECRET）；整段对话清空仅主管理员可操作、确认防重复执行、访客记录已删时点确认不再把空档案建回来，且清空只删开始那一刻收集到的快照记录（清空期间新到的消息配对不受影响），提示行改分块批量查询与批量删除；拉黑提醒记账竞态收尾，删档与超时清理一并清记账；主菜单追踪清扫按值条件删防误删新鲜记录、原地编辑不再刷新追踪时间戳（时间戳只记消息号的出生时刻）、旧格式纯数字追踪恢复解析；话题被手动关闭时先重开原话题再投递、不再误判失效重建；转发失败（内容受保护等）会在话题里提醒、群权限丢失时改走主管理员私聊告警；已验证访客发送过频会被限流丢弃并提醒；反应同步补匿名管理员处理，付费/自定义 emoji 不再误清已镜像的普通反应；短暂通知落 ephem 记账，定时删除没赶上时由数据库清扫补删；菜单签名链接的来源地址改为随请求传递（去掉可被任意请求覆盖的全局变量）；以频道身份发帖等没有 from 的消息直接忽略、不再抛错；命令 @ 的机器人名不是本机器人时完全忽略；/note 保存失败时保留命令原文便于改了重发。定制化扩展：管理台「基础配置」含参数与开关（转发限流强度、通行证/验证链接有效期、问答锁定次数与时长、命令回执停留秒数可调，均带范围校验；功能开关含编辑提示——已拆为「访客编辑是否提醒我」「我编辑是否提醒访客」两项，外加反应同步、转发失败提醒、拉黑提醒），另有「文案与呈现」（验证成功/答错、熔断恢复、拉黑/解封五句文案可改；话题名四种样式；主菜单五个按钮逐个显隐；访客列表默认排序与每页条数存服务端配置）；按访客例外：信任开关（is_trusted 与 relay_exempt 已合并为一个概念、两标记同写同清：列表/资料卡设置即置已验证并按验证成功收尾，闸门处对未验证的信任访客自动放行，一并免转发限流与类型过滤、免两种超时清理，关键词屏蔽与自动封禁照常生效；重置验证与 /reverify 连带撤销，资料卡按钮仅主管理员），列表行带「🤝 已信任」徽标与切换按钮，/api/users 附 uiDefaults 供列表页套用默认排序与页大小。
  * 三页（指南 / 管理台 / 访客列表）约定
  * - 页眉 position:fixed + 脚本实测高度补偿 body padding-top，
  *   不要改回 sticky：iOS 上 sticky 在滚动中逐帧重定位会闪烁。
@@ -75,6 +75,8 @@ const DEFAULTS = {
   notice_stay_sec: '5',
 
   hint_enabled: 'true',
+  hint_on_visitor_edit: 'true',
+  hint_on_admin_edit: 'true',
   reaction_sync_enabled: 'true',
   relay_fail_notice_enabled: 'true',
   block_notice_enabled: 'true',
@@ -1191,6 +1193,16 @@ async function cleanupExpiredUsers(env, now) {
       env
     );
 
+    await dbConfigDelete(
+      `bannotice:${userId}`,
+      env
+    );
+
+    await dbConfigDelete(
+      `unbannotice:${userId}`,
+      env
+    );
+
     // 拉黑提醒：话题还在时先删话题里的 🚫 本体，
     // 再删记账行（与删人路径同口径）。
     const staleBlockNotice =
@@ -2177,6 +2189,9 @@ function getInfoCardButtons(
   isTrusted = false,
   isExempt = false
 ) {
+  // 静音按钮已下线：「静音通知」与 Telegram 原生免打扰
+  // 不是一回事、误导性太强。is_muted 字段本身、转发副本
+  // 的静默投递与超时清理豁免口径全部保留（存量冻结）。
   const rows = [
     [
       {
@@ -2185,14 +2200,6 @@ function getInfoCardButtons(
           : '🚫 屏蔽访客',
         callback_data:
           `${isBlocked ? 'unblock' : 'block'}:` +
-          `${userId}`
-      },
-      {
-        text: isMuted
-          ? '🔔 恢复通知'
-          : '🔕 静音通知',
-        callback_data:
-          `${isMuted ? 'unmute' : 'mute'}:` +
           `${userId}`
       }
     ],
@@ -2209,21 +2216,18 @@ function getInfoCardButtons(
     ]
   ];
 
+  // 信任与放行已合并为一个开关：存量里任一标记为真
+  // 都按「已信任」呈现，卡上只留信任一个按钮
+  // （写入时两标记同动，见 trust 回调与列表 trust 动作）。
+  const trustOn = isTrusted || isExempt;
+
   rows.push([
     {
-      text: isTrusted
+      text: trustOn
         ? '↩️ 取消信任'
         : '🤝 设为信任',
       callback_data:
-        `${isTrusted ? 'untrust' : 'trust'}:` +
-        `${userId}`
-    },
-    {
-      text: isExempt
-        ? '↩️ 取消放行'
-        : '🕊 设为放行',
-      callback_data:
-        `${isExempt ? 'unexempt' : 'exempt'}:` +
+        `${trustOn ? 'untrust' : 'trust'}:` +
         `${userId}`
     }
   ]);
@@ -3332,7 +3336,8 @@ async function relayAdminMessageToUser(
 
 const REACTION_MAP_USER = 'rxmap';
 
-const EDIT_HINT_TEXT = '✏️ 对方修改了这条消息';
+const EDIT_HINT_TEXT = '✍🏼已编辑';
+const EDIT_HINT_BUTTON_TEXT = '系统提示';
 
 async function storeMessagePair(
   userId,
@@ -3375,9 +3380,25 @@ async function storeMessagePair(
   }
 }
 
+// 编辑提示按方向分别开关（面板两项）：新键已存以新键
+// 为准，未存时回退旧总开关 hint_enabled——存量关过总开
+// 关的继续两边都关。旧键面板不再写入，仅只读兼容。
+async function editHintEnabled(configKey, env) {
+  const own = await dbConfigGet(configKey, env);
+
+  if (own !== null) {
+    return own === 'true';
+  }
+
+  return (
+    (await getConfig('hint_enabled', env, 'true')) ===
+    'true'
+  );
+}
+
 async function replaceEditHint(
   env,
-  { chatId, threadId, replyToMessageId, hintKey }
+  { chatId, threadId, replyToMessageId, hintKey, configKey }
 ) {
   const oldHint = await dbMessageDataGet(
     REACTION_MAP_USER,
@@ -3403,10 +3424,7 @@ async function replaceEditHint(
     }
   }
 
-  if (
-    (await getConfig('hint_enabled', env, 'true')) !==
-    'true'
-  ) {
+  if (!(await editHintEnabled(configKey, env))) {
     // 关着的时候旧提示上面已经删了：指针记录一并清掉，
     // 否则之后每次编辑都会对那个已不存在的消息号重复发删除。
     if (oldHint?.text) {
@@ -3426,6 +3444,19 @@ async function replaceEditHint(
       text: EDIT_HINT_TEXT,
       reply_parameters: {
         message_id: Number(replyToMessageId)
+      },
+      // 防伪按钮：访客消息经 copyMessage 搬运永远带不了
+      // 内联按钮，带按钮的提示行必是机器人真迹。按钮纯作
+      // 标记，hint:info 回调只空应答。
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: EDIT_HINT_BUTTON_TEXT,
+              callback_data: 'hint:info'
+            }
+          ]
+        ]
       }
     };
 
@@ -4592,21 +4623,7 @@ async function handleVerification(
 
   await cleanupAfterVerified(env, chatId);
 
-  const successSent = await telegramApi(
-    env.BOT_TOKEN,
-    'sendMessage',
-    {
-      chat_id: chatId,
-      text: await textConfig('verify_success_text', env)
-    }
-  );
-
-  await trackSlotMessage(
-    env,
-    chatId,
-    'receipt_msg_id',
-    successSent?.message_id
-  );
+  await sendVerifySuccessReceipt(env, chatId);
 
   return true;
 }
@@ -5148,24 +5165,7 @@ async function handleSequenceCallback(
 
         await cleanupAfterVerified(env, senderId);
 
-        const successSent = await telegramApi(
-          env.BOT_TOKEN,
-          'sendMessage',
-          {
-            chat_id: senderId,
-            text: await textConfig(
-              'verify_success_text',
-              env
-            )
-          }
-        );
-
-        await trackSlotMessage(
-          env,
-          senderId,
-          'receipt_msg_id',
-          successSent?.message_id
-        );
+        await sendVerifySuccessReceipt(env, senderId);
 
         await ans('🎉 验证通过！');
 
@@ -5713,6 +5713,71 @@ async function clearSlotMessage(env, userId, column) {
   );
 
   await quietDeleteMessage(env, userId, oldId);
+}
+
+// 验证成功回执（🎉）的统一发送口：发 verify_success_text
+// 并把回执编号记进 receipt_msg_id 槽位。记账（trackSlotMessage）
+// 失败时原地重试至多 3 次（间隔 300ms，照资料卡写回重试的
+// 先例）；仍记不上就把刚发出的这条回执反手删掉——宁可这
+// 一次没有回执，也不能留下一个没登记、永远删不掉的孤儿
+// 回执。全程不抛：发送或记账出任何问题只记日志，返回
+// 回执编号或 null，五条验证成功路径共用本口。
+async function sendVerifySuccessReceipt(env, userId) {
+  let sent = null;
+
+  try {
+    sent = await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: userId,
+        text: await textConfig('verify_success_text', env)
+      }
+    );
+  } catch (error) {
+    console.error(
+      '发送验证成功回执失败：',
+      error?.message || error
+    );
+
+    return null;
+  }
+
+  const receiptId = sent?.message_id;
+
+  if (!receiptId) {
+    return null;
+  }
+
+  let trackError = null;
+
+  for (let w = 0; w < 3; w += 1) {
+    try {
+      await trackSlotMessage(
+        env,
+        userId,
+        'receipt_msg_id',
+        receiptId
+      );
+
+      return receiptId;
+    } catch (error) {
+      trackError = error;
+
+      if (w < 2) {
+        await sleep(300);
+      }
+    }
+  }
+
+  console.error(
+    '登记验证成功回执多次失败，已撤回该回执避免留下孤儿：',
+    trackError?.message || trackError
+  );
+
+  await quietDeleteMessage(env, userId, receiptId);
+
+  return null;
 }
 
 // 作废某访客的未用通行证：删记录并删掉证消息。
@@ -6440,25 +6505,7 @@ async function handlePassConfirm(request, env) {
   await cleanupAfterVerified(env, u);
 
   if (!wasVerified) {
-
-    try {
-      const successSent = await telegramApi(env.BOT_TOKEN, 'sendMessage', {
-        chat_id: u,
-        text: await textConfig('verify_success_text', env)
-      });
-
-      await trackSlotMessage(
-        env,
-        u,
-        'receipt_msg_id',
-        successSent?.message_id
-      );
-    } catch (error) {
-      console.error(
-        '通行证通过后通知访客失败：',
-        error?.message || error
-      );
-    }
+    await sendVerifySuccessReceipt(env, u);
   }
 
   await dbConfigDelete(`passconfirmtry:${u}`, env);
@@ -6745,29 +6792,7 @@ async function handleVerifyConfirm(
 
     await cleanupAfterVerified(env, u);
 
-    try {
-      const successSent = await telegramApi(
-        env.BOT_TOKEN,
-        'sendMessage',
-        {
-          chat_id: u,
-          text: await textConfig('verify_success_text', env)
-        }
-      );
-
-      await trackSlotMessage(
-        env,
-        u,
-        'receipt_msg_id',
-        successSent?.message_id
-      );
-    } catch (error) {
-      // 状态已保存，通知失败只记日志，不让接口报 500 误导访客。
-      console.error(
-        '验证成功后通知访客失败：',
-        error?.message || error
-      );
-    }
+    await sendVerifySuccessReceipt(env, u);
   }
 
   await dbConfigDelete(`confirmtry:${u}`, env);
@@ -6784,6 +6809,142 @@ async function handleVerifyConfirm(
 /* -------------------------------------------------------------------------- */
 /*                               私聊消息处理                                    */
 /* -------------------------------------------------------------------------- */
+
+// 封禁/解封的统一生效口径：/ban、/unban、资料卡、网页列表与
+// 关键词自动封禁全部走这里，任何入口的效果完全一致。
+// 封禁：写标记；先撤未销的解封通知；再发封禁通知并把编号记进
+// bannotice:<uid>（已在册则不重发，保证永远只有一条）。
+// 解封：写标记并清零命中计数；先撤封禁通知；再发解封通知并把
+// 编号记进 unbannotice:<uid>（旧的先撤，保证永远只有一条），
+// 该通知由访客的下一条新消息撤回（见 handlePrivateMessage）。
+// 通知发送失败（对方已先拉黑机器人等）只记日志，不中断状态变更。
+async function applyBlockState(userId, blocked, env) {
+  const uid = String(userId);
+
+  if (blocked) {
+    await dbUserUpdate(
+      uid,
+      { is_blocked: true },
+      env
+    );
+
+    const staleUnbanNotice =
+      await dbConfigGet(`unbannotice:${uid}`, env);
+
+    if (staleUnbanNotice) {
+      await quietDeleteMessage(
+        env,
+        uid,
+        staleUnbanNotice
+      );
+
+      await dbConfigDelete(
+        `unbannotice:${uid}`,
+        env
+      );
+    }
+
+    const existingBanNotice =
+      await dbConfigGet(`bannotice:${uid}`, env);
+
+    if (!existingBanNotice) {
+      try {
+        const sent = await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: uid,
+            text:
+              '⚠️ 您已被管理员封禁，' +
+              '无法继续发送消息。'
+          }
+        );
+
+        if (sent?.message_id) {
+          await dbConfigPut(
+            `bannotice:${uid}`,
+            String(sent.message_id),
+            env
+          );
+        }
+      } catch (error) {
+        console.error(
+          '发送封禁通知失败：',
+          error?.message || error
+        );
+      }
+    }
+
+    return;
+  }
+
+  await dbUserUpdate(
+    uid,
+    {
+      is_blocked: false,
+      block_count: 0
+    },
+    env
+  );
+
+  const staleBanNotice =
+    await dbConfigGet(`bannotice:${uid}`, env);
+
+  if (staleBanNotice) {
+    await quietDeleteMessage(
+      env,
+      uid,
+      staleBanNotice
+    );
+
+    await dbConfigDelete(
+      `bannotice:${uid}`,
+      env
+    );
+  }
+
+  const staleUnbanNotice =
+    await dbConfigGet(`unbannotice:${uid}`, env);
+
+  if (staleUnbanNotice) {
+    await quietDeleteMessage(
+      env,
+      uid,
+      staleUnbanNotice
+    );
+
+    await dbConfigDelete(
+      `unbannotice:${uid}`,
+      env
+    );
+  }
+
+  try {
+    const sent = await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: uid,
+        text:
+          '✅ 管理员已解除对您的封禁，' +
+          '现在可以继续发送消息。'
+      }
+    );
+
+    if (sent?.message_id) {
+      await dbConfigPut(
+        `unbannotice:${uid}`,
+        String(sent.message_id),
+        env
+      );
+    }
+  } catch (error) {
+    console.error(
+      '发送解禁通知失败：',
+      error?.message || error
+    );
+  }
+}
 
 async function handleBlockedKeyword(
   userId,
@@ -6813,16 +6974,9 @@ async function handleBlockedKeyword(
   );
 
   if (result.shouldAutoBlock) {
-    await telegramApi(
-      env.BOT_TOKEN,
-      'sendMessage',
-      {
-        chat_id: chatId,
-        text:
-          '❌ 您已多次触发关键词过滤，' +
-          '当前已被自动屏蔽。'
-      }
-    );
+    // 自动封禁与其余封禁入口同口径，走统一生效函数：
+    // 发在册的封禁通知，不再另发一条专属文案。
+    await applyBlockState(userId, true, env);
   }
 
   console.log(
@@ -7054,6 +7208,47 @@ async function handlePrivateMessage(
 
   const isAdmin =
     await isAdminUser(userId, env);
+
+  // 被屏蔽访客的新消息：先从其私聊里删掉这条消息再
+  // 丢弃（与熔断期间删消息同手法），不转发、不回复、
+  // 不发任何提示。收口放在全部命令分发之前，普通消息
+  // 与 /start 等命令消息一并适用；管理员（含协管员）
+  // 豁免。熔断闸门在 handleUpdate 更前面处理熔断期
+  // 消息，两边互不干扰（重复删由 quiet 口径吞掉）。
+  if (!isAdmin) {
+    const earlyUser =
+      await dbUserGet(userId, env);
+
+    if (earlyUser?.is_blocked) {
+      await quietDeleteMessage(
+        env,
+        chatId,
+        message.message_id
+      );
+
+      return;
+    }
+
+    // 解封通知只保留到访客的下一条新消息：此刻先撤回
+    // 并清键，再照常处理这条消息。仍被封禁者已在上方
+    // 返回，且封禁生效时已连带清掉解封通知，不会走到
+    // 这里误撤。
+    const staleUnbanNotice =
+      await dbConfigGet(`unbannotice:${userId}`, env);
+
+    if (staleUnbanNotice) {
+      await quietDeleteMessage(
+        env,
+        chatId,
+        staleUnbanNotice
+      );
+
+      await dbConfigDelete(
+        `unbannotice:${userId}`,
+        env
+      );
+    }
+  }
 
   if (
     commandText === '/start' ||
@@ -7517,6 +7712,21 @@ async function handlePrivateMessage(
     }
 
     return;
+  }
+
+  // 成功回执的使命在「已验证访客开始正常发消息」时就
+  // 已经完成：不等转发成功，先在进入关键词/过滤/限流
+  // 之前撤回。否则第一条消息若被关键词拦下、被类型
+  // 过滤拒绝或被限流丢弃（都在转发之前返回），回执会
+  // 永远等不到转发末尾的那次清理；转发中途抛错同理。
+  // 用已加载的 user 行把关，没有在册回执就不多读一次；
+  // 转发末尾原有的清理保留作兜底（届时槽位已空，是空转）。
+  if (user.receipt_msg_id) {
+    await clearSlotMessage(
+      env,
+      userId,
+      'receipt_msg_id'
+    );
   }
 
   const hitKeyword =
@@ -8025,7 +8235,8 @@ async function handleAdminCommand(
       userId,
       {
         user_state: USER_STATE.PENDING,
-        is_trusted: 0
+        is_trusted: 0,
+        relay_exempt: 0
       },
       env
     );
@@ -8171,19 +8382,12 @@ async function handleAdminCommand(
       return true;
     }
 
-    const user =
-      await dbUserGetOrCreate(
-        userId,
-        env
-      );
-
-    await dbUserUpdate(
+    await dbUserGetOrCreate(
       userId,
-      {
-        is_blocked: true
-      },
       env
     );
+
+    await applyBlockState(userId, true, env);
 
     await sendEphemeralTopicNotice(
       message,
@@ -8191,26 +8395,6 @@ async function handleAdminCommand(
       env,
       ctx
     );
-
-    if (!user.is_blocked) {
-      try {
-        await telegramApi(
-          env.BOT_TOKEN,
-          'sendMessage',
-          {
-            chat_id: userId,
-            text:
-              '⚠️ 您已被管理员封禁，' +
-              '无法继续发送消息。'
-          }
-        );
-      } catch (error) {
-        console.error(
-          '发送封禁通知失败：',
-          error?.message || error
-        );
-      }
-    }
 
     return true;
   }
@@ -8234,14 +8418,7 @@ async function handleAdminCommand(
       return true;
     }
 
-    await dbUserUpdate(
-      userId,
-      {
-        is_blocked: false,
-        block_count: 0
-      },
-      env
-    );
+    await applyBlockState(userId, false, env);
 
     await sendEphemeralTopicNotice(
       message,
@@ -8249,24 +8426,6 @@ async function handleAdminCommand(
       env,
       ctx
     );
-
-    try {
-      await telegramApi(
-        env.BOT_TOKEN,
-        'sendMessage',
-        {
-          chat_id: userId,
-          text:
-            '✅ 管理员已解除对您的封禁，' +
-            '现在可以继续发送消息。'
-        }
-      );
-    } catch (error) {
-      console.error(
-        '发送解禁通知失败：',
-        error?.message || error
-      );
-    }
 
     return true;
   }
@@ -8976,7 +9135,8 @@ ${capEscapedText(escapeHtml(newContent), 2600)}
       chatId: env.ADMIN_GROUP_ID,
       threadId: Number(user.topic_id),
       replyToMessageId: Number(pair.text),
-      hintKey
+      hintKey,
+      configKey: 'hint_on_visitor_edit'
     });
 
     try {
@@ -9160,7 +9320,8 @@ ${capEscapedText(escapeHtml(newText), 2600)}
     await replaceEditHint(env, {
       chatId: userId,
       replyToMessageId: Number(counterpartId),
-      hintKey
+      hintKey,
+      configKey: 'hint_on_admin_edit'
     });
 
     return;
@@ -9249,14 +9410,10 @@ async function handleUserCardCallback(
   const allowedActions = new Set([
     'block',
     'unblock',
-    'mute',
-    'unmute',
     'pin_card',
     'refresh_card',
     'trust',
-    'untrust',
-    'exempt',
-    'unexempt'
+    'untrust'
   ]);
 
   if (
@@ -9323,9 +9480,10 @@ async function handleUserCardCallback(
     }
 
     if (action === 'untrust') {
+      // 合并口径：取消信任连带取消放行，两标记同清。
       await dbUserUpdate(
         targetUserId,
-        { is_trusted: 0 },
+        { is_trusted: 0, relay_exempt: 0 },
         env
       );
     } else {
@@ -9345,7 +9503,7 @@ async function handleUserCardCallback(
         // 也不顶掉既有的验证回执槽。
         await dbUserUpdate(
           targetUserId,
-          { is_trusted: 1 },
+          { is_trusted: 1, relay_exempt: 1 },
           env
         );
       } else {
@@ -9353,6 +9511,7 @@ async function handleUserCardCallback(
           targetUserId,
           {
             is_trusted: 1,
+            relay_exempt: 1,
             user_state: USER_STATE.VERIFIED
           },
           env
@@ -9360,31 +9519,7 @@ async function handleUserCardCallback(
 
         await cleanupAfterVerified(env, targetUserId);
 
-        try {
-          const successSent = await telegramApi(
-            env.BOT_TOKEN,
-            'sendMessage',
-            {
-              chat_id: targetUserId,
-              text: await textConfig(
-                'verify_success_text',
-                env
-              )
-            }
-          );
-
-          await trackSlotMessage(
-            env,
-            targetUserId,
-            'receipt_msg_id',
-            successSent?.message_id
-          );
-        } catch (error) {
-          console.error(
-            '发送信任验证成功提示失败：',
-            error?.message || error
-          );
-        }
+        await sendVerifySuccessReceipt(env, targetUserId);
       }
     }
 
@@ -9524,64 +9659,12 @@ async function handleUserCardCallback(
       action === 'block' ||
       action === 'unblock'
     ) {
-      await dbUserUpdate(
+      // 与 /ban、/unban 及网页列表完全同口径（统一
+      // 生效函数）：解封连带清零关键词命中计数，否则
+      // 旧计数仍达阈值、再命中一次就立刻被再次封禁。
+      await applyBlockState(
         targetUserId,
-        action === 'block'
-          ? { is_blocked: true }
-          // 解封与 /unban 同口径：连带清零关键词命中
-          // 计数，否则旧计数仍达阈值、再命中一次就
-          // 立刻被再次自动封禁。
-          : { is_blocked: false, block_count: 0 },
-        env
-      );
-    }
-
-    if (
-      action === 'mute' ||
-      action === 'unmute'
-    ) {
-      await dbUserUpdate(
-        targetUserId,
-        {
-          is_muted:
-            action === 'mute'
-        },
-        env
-      );
-    }
-
-    if (
-      action === 'exempt' ||
-      action === 'unexempt'
-    ) {
-      // 放行会绕过转发限流与类型过滤两道保护，与信任同级，
-      // 只允许主管理员操作（网页列表那条路径同样强制主管理员）。
-      if (
-        !isPrimaryAdmin(
-          callbackQuery.from?.id,
-          env
-        )
-      ) {
-        await telegramApi(
-          env.BOT_TOKEN,
-          'answerCallbackQuery',
-          {
-            callback_query_id:
-              callbackQuery.id,
-            text: '放行设置仅主管理员可操作',
-            show_alert: true
-          }
-        );
-
-        return;
-      }
-
-      await dbUserUpdate(
-        targetUserId,
-        {
-          relay_exempt:
-            action === 'exempt'
-        },
+        action === 'block',
         env
       );
     }
@@ -9621,22 +9704,6 @@ async function handleUserCardCallback(
 
     if (action === 'unblock') {
       toast = '✅ 已解除屏蔽。';
-    }
-
-    if (action === 'exempt') {
-      toast = '🕊 已设为放行（免限流与类型过滤）。';
-    }
-
-    if (action === 'unexempt') {
-      toast = '↩️ 已取消放行。';
-    }
-
-    if (action === 'mute') {
-      toast = '🔕 已静音通知。';
-    }
-
-    if (action === 'unmute') {
-      toast = '🔔 已恢复通知。';
     }
 
     await answerCallback(
@@ -9681,6 +9748,16 @@ async function handleCallbackQuery(
       callbackQuery,
       env
     );
+
+    return;
+  }
+
+  // 编辑提示的防伪按钮纯作视觉标记：话题侧点击者是管理
+  // 员、私聊侧是访客本人，后者过不了下面的管理员校验
+  // ——与 seq: 同理须在此前分发；点击只空应答，不做任何
+  // 核对或写操作。
+  if (data === 'hint:info') {
+    await answerCallback(callbackQuery.id, env);
 
     return;
   }
@@ -9981,7 +10058,7 @@ async function handleMyChatMember(
 }
 
 // 整段对话清空：按 rxmap 配对收集一位访客在私聊与话题两侧的全部消息编号
-// （含 ✏️ 编辑提示消息），供批量删除使用。配对值 'gone'（已单独删除的墓碑）跳过。
+// （含「✍🏼已编辑」提示行），供批量删除使用。配对值 'gone'（已单独删除的墓碑）跳过。
 async function collectConversationMessageIds(
   userId,
   env
@@ -10720,6 +10797,16 @@ async function purgeManagedUser(
 
   await dbConfigDelete(
     `seq:${userId}`,
+    env
+  );
+
+  await dbConfigDelete(
+    `bannotice:${userId}`,
+    env
+  );
+
+  await dbConfigDelete(
+    `unbannotice:${userId}`,
     env
   );
 
@@ -11807,7 +11894,7 @@ function buildGuidePage() {
       <li><b class=\"k\">让某人重新验证：</b>打开他的话题，发送 <code>/reverify</code>，他下一次发消息前要重新过一遍验证。</li>
       <li><b class=\"k\">自己先试一遍：</b>私聊发送 <code>/testverify</code> 会拿到一个测试验证链接，点开能看到访客眼中的验证页长什么样；测试模式只是看看样子，不会真的放行或记录任何人。</li>
       <li><b class=\"k\">🎫 一次性通行证（救济通道）：</b>个别访客怎么也过不了验证（比如网络连不上验证服务）时，在访客列表里他那一行点「🎫 通行证」，机器人会私聊发给他一张通行证（默认 30 分钟内有效，有效期可在管理台「基础配置」里改），他点开确认即通过验证。通行证必须本人点开才有效，转发给别人没用，用过即作废；不依赖 Turnstile 配置，没配密钥也能发。</li>
-      <li><b class=\"k\">🤝 信任（免验证）：</b>熟人可以免掉验证：在访客列表他那一行点「🤝 信任」，或在他话题的资料卡上点「设为信任」，他立即通过验证（会收到验证成功提示），以后也一直免验证；点「取消信任」收回。注意：对他「重置验证」或在话题里发 /reverify 会连信任一起撤销；被封禁的人要先解封才能设信任；资料卡上的信任按钮只有主管理员能操作。</li>
+      <li><b class=\"k\">🤝 信任：</b>熟人可以免掉验证：在访客列表他那一行点「🤝 信任」，或在他话题的资料卡上点「设为信任」，他立即通过验证（会收到验证成功提示）。信任只有一个开关，开启后一并免验证、免转发限流、免类型过滤、免超时清理（删档版与温和版都免）；但屏蔽关键词与关键词自动封禁对他仍然有效。点「取消信任」收回。注意：对他「重置验证」或在话题里发 /reverify 会连信任一起撤销；被封禁的人要先解封才能设信任；资料卡上的信任按钮只有主管理员能操作。</li>
       <li><b class=\"k\">验证消息会自己清理：</b>验证提示、欢迎消息、通行证和「🎉 验证成功」这类流程消息，用完后会被机器人自动删掉，不在访客对话里堆积：反复索要验证只留最新一条提示，通过验证时提示、欢迎消息和访客自己发的那条 /start 会一并清掉，成功提示等他第一条正经消息送达后再删；过期没用的通行证会在他下次来发消息时清扫。</li>
     </ul>
   </section>
@@ -11815,9 +11902,9 @@ function buildGuidePage() {
   <section id=\"g-chat\">
     <h2>💬 接待日常</h2>
     <ul>
-      <li><b class=\"k\">资料卡：</b>每个话题顶部都钉着访客的资料卡（名字、ID、状态、你的备注）。卡片不见了就在话题里发 <code>/card</code> 重新生成；卡片上的按钮可以直接封禁、解封、静音、刷新。</li>
+      <li><b class=\"k\">资料卡：</b>每个话题顶部都钉着访客的资料卡（名字、ID、状态、你的备注）。卡片不见了就在话题里发 <code>/card</code> 重新生成；卡片上的按钮可以直接屏蔽 / 解除屏蔽、设为信任、置顶、刷新。</li>
       <li><b class=\"k\">引用回复会跟着走：</b>你在话题里引用某条消息再回复，访客那边看到的也是引用着他原话的回复；访客引用着回复你时同理，连他框选一小段文字的「部分引用」都会原样带过去。</li>
-      <li><b class=\"k\">改错字会同步：</b>直接编辑你已发送的消息，对方那边会同步改好，旁边出现一行「✏️ 对方修改了这条消息」的小提示。Telegram 不给机器人提供官方的「已编辑」标记，这行提示就是补这个用的；访客编辑他的消息时，你这边也一样。</li>
+      <li><b class=\"k\">改错字会同步：</b>直接编辑你已发送的消息，对方那边会同步改好，旁边出现一行「✍🏼已编辑」的小提示，提示下还挂着一颗「系统提示」按钮：按钮只有机器人能给消息挂上，访客自己发的消息带不了，所以同文案、没按钮的就是仿冒的，不用理会。Telegram 不给机器人提供官方的「已编辑」标记，这行提示就是补这个用的；访客编辑他的消息时，你这边也一样。两个方向的提示可以在管理台里分别开关：「访客编辑是否提醒我」与「我编辑是否提醒访客」。</li>
       <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。注意：访客私聊那边的原消息只能删 48 小时以内的，超了删不掉时会在话题里留一行说明。</li>
       <li><b class=\"k\">整段对话清空：</b>在话题里发 <code>/clear</code> 并点确认，会把这个话题里的转发副本和访客私聊里的聊天副本成批删掉，话题本身保留、之后还能接着聊；48 小时前的私聊消息删不掉，清完会在话题里报告删了多少、多少删不掉。这个操作只有主管理员能做，协管员发命令或点确认都会被拦下。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
@@ -11831,8 +11918,8 @@ function buildGuidePage() {
   <section id=\"g-cmd\">
     <h2>⌨️ 命令速查</h2>
     <p>下面这些命令都在<b class=\"k\">访客的话题里</b>发送（在私聊里发没用）：</p>
-    <div class=\"cmd\"><code>/ban</code><div>封禁这位访客：他的消息不再转进来。</div></div>
-    <div class=\"cmd\"><code>/unban</code><div>解除封禁，恢复正常转发。</div></div>
+    <div class=\"cmd\"><code>/ban</code><div>封禁这位访客：他再发来的消息会被当场删掉、不再转进来，他会收到一条「⚠️ 您已被管理员封禁，无法继续发送消息。」的通知。</div></div>
+    <div class=\"cmd\"><code>/unban</code><div>解除封禁：他会收到一条「✅ 管理员已解除对您的封禁，现在可以继续发送消息。」，之后恢复正常转发。</div></div>
     <div class=\"cmd\"><code>/delete</code><div>先回复选中一条消息、再发这条命令：双向删除那条消息。</div></div>
     <div class=\"cmd\"><code>/terminate</code><div>结束会话并删掉整个话题（删了找不回来，谨慎用）。</div></div>
     <div class=\"cmd\"><code>/clear</code><div>清空和这位访客的整段聊天记录：话题里的转发副本和访客私聊里的副本一起删（会先弹确认按钮），话题和访客档案保留；私聊里 48 小时前的消息删不掉，清完会报告条数。</div></div>
@@ -11853,9 +11940,9 @@ function buildGuidePage() {
     <h2>🛠 网页管理台</h2>
     <p>从主菜单打开，<b class=\"k\">只有主管理员能进</b>。所有设置都集中在这里，改完点对应的「保存」立即生效：</p>
     <ul>
-      <li><b class=\"k\">基础配置：</b>欢迎消息、验证方式与题目、已验证超时清理（两种）。删档版填一个天数（比如 90），长期没动静的访客会被自动清除并释放位置；填 0 表示永不自动清。注意：被清掉的人下次再来会新建一个话题，老话题会留着当存档。另有温和版「改回待验证」：同样在基础配置里填天数，到期只把人改回待验证，档案、备注与话题都留着，对方回来重新验证后还在原话题继续聊；两种可以同时开，一般温和版的天数设得更小。这一区还管参数与开关：转发限流的强度、通行证与验证链接的有效期、问答锁定的次数与时长、命令回执停留几秒（数字都带安全范围，填超了不保存），以及四个功能开关——编辑提示、反应同步、转发失败提醒、拉黑提醒，用不上哪个就关掉。</li>
+      <li><b class=\"k\">基础配置：</b>欢迎消息、验证方式与题目、已验证超时清理（两种）。删档版填一个天数（比如 90），长期没动静的访客会被自动清除并释放位置；填 0 表示永不自动清。注意：被清掉的人下次再来会新建一个话题，老话题会留着当存档。另有温和版「改回待验证」：同样在基础配置里填天数，到期只把人改回待验证，档案、备注与话题都留着，对方回来重新验证后还在原话题继续聊；两种可以同时开，一般温和版的天数设得更小。这一区还管参数与开关：转发限流的强度、通行证与验证链接的有效期、问答锁定的次数与时长、命令回执停留几秒（数字都带安全范围，填超了不保存），以及功能开关：编辑提示已经拆成两项——「访客编辑是否提醒我」和「我编辑是否提醒访客」，两个方向可以只关一个；外加反应同步、转发失败提醒、拉黑提醒，用不上哪个就关掉。</li>
       <li><b class=\"k\">类型过滤：</b>不想转发的消息类型（贴纸、语音、视频等）在这里关掉，对方发了也不会过到对面去。</li>
-      <li><b class=\"k\">屏蔽关键词：</b>访客的话里出现关键词会被拦下并记一次数，次数达到你设的阈值就自动封禁他。不会写正则表达式也没关系，直接填普通词句就行。</li>
+      <li><b class=\"k\">屏蔽关键词：</b>访客的话里出现关键词会被拦下并记一次数，次数达到你设的阈值就自动封禁他，口径与手动封禁完全一致（新消息即删、同样发送封禁通知）。不会写正则表达式也没关系，直接填普通词句就行。</li>
       <li><b class=\"k\">自动回复：</b>访客的话包含某个词时，机器人自动回一句你预设的话（比如包含「价格」就自动回价目说明）。</li>
       <li><b class=\"k\">协管员：</b>把帮你接待的人的 Telegram 数字 ID 填进来（多个用逗号隔开）。协管员能在话题里回复、用命令、贴表情，但进不了网页管理台，也看不到访客列表。</li>
       <li><b class=\"k\">服务熔断：</b>被消息轰炸时在这里一键暂停机器人（或用 /pause 命令），可设定暂停时长、到期自动恢复；还能设置暂停期间给访客的回复语句，或关掉回复保持完全静默。</li>
@@ -11869,7 +11956,7 @@ function buildGuidePage() {
     <ul>
       <li><b class=\"k\">两个标签页：</b>「访客列表」和「数据统计」，默认打开列表页，点顶部标签切换。</li>
       <li><b class=\"k\">找人：</b>顶部搜索框可以按名字、用户名、数字 ID、甚至你写的备注来搜；下面的「全部 / 已验证 / 待验证 / 已屏蔽」是快速筛选；还能换排序顺序。</li>
-      <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动；“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里 48 小时前的消息删不掉，清完会报告条数）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。行里还有「🤝 信任」（设为信任后免验证，见「验证」一节）和「🕊 放行」（对这个人免转发限流、免类型过滤，适合话多或常发大文件的人；关键词封禁对他照常有效）；设了信任或放行的人，行上会挂对应徽标。</li>
+      <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动；“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里 48 小时前的消息删不掉，清完会报告条数）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。行里还有「🤝 信任」（只有一个信任开关：免验证、免转发限流、免类型过滤、免超时清理，见「验证」一节；关键词封禁对他照常有效）和「🚫 屏蔽 / ✅ 解封」（与 /ban、/unban 同一套封禁：屏蔽后他再发来的新消息会被立即删掉；解封时他会收到一条解除通知）；设为信任的人行上会挂「🤝 已信任」徽标，屏蔽中的人挂「已屏蔽」徽标。</li>
       <li><b class=\"k\">统计页：</b>能看到访客总数、已验证 / 待验证人数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
     </ul>
   </section>
@@ -11890,7 +11977,7 @@ function buildGuidePage() {
     <p class=\"q\">输入 / 时，/note 这些新命令不出现在候选里？</p>
     <p>那是 Telegram App 自己缓存了旧的命令名单，彻底关掉 App 再重开就会刷新；等不及也可以把命令手打全，一样有效。</p>
     <p class=\"q\">编辑过的消息为什么没有官方的「已编辑」小字？</p>
-    <p>Telegram 不允许机器人给消息加官方编辑标记，所以机器人用一行「✏️ 对方修改了这条消息」的提示代替，一样看得懂。</p>
+    <p>Telegram 不允许机器人给消息加官方编辑标记，所以机器人用一行「✍🏼已编辑」的提示代替；提示下挂着一颗「系统提示」按钮，访客自己发的消息带不了按钮，同文案又没按钮的就是仿冒提示，一眼可辨。</p>
     <p class=\"q\">贴的表情为什么显示成机器人贴的？</p>
     <p>Telegram 只允许机器人以自己的名义贴表情，同步到对方那边自然显示机器人名字，这个改不了。</p>
     <p class=\"q\">访客说验证一直过不了，怎么办？</p>
@@ -12012,6 +12099,7 @@ function buildPanelPage() {
   .swrow:last-child { border-bottom: 0; }
   .swrow span { font-size: 14.5px; }
   .swrow input { width: 22px; height: 22px; accent-color: #2b5278; }
+  input.chk { width: 22px; height: 22px; accent-color: #2b5278; margin: 2px 0 4px; }
   .item { display: flex; gap: 8px; align-items: flex-start; padding: 8px 0; border-bottom: 1px solid #22303d; }
   .item:last-child { border-bottom: 0; }
   .item .tx { flex: 1; font-size: 14px; word-break: break-all; line-height: 1.5; }
@@ -12095,9 +12183,13 @@ function buildPanelPage() {
     <label>命令回执停留秒数（1～120）</label>
     <input type="number" id="t_stay" min="1" max="120" step="1">
     <button class="save" data-k="notice_stay_sec" data-t="t_stay">保存</button>
-    <label>✏️ 编辑提示（编辑同步时那行小提示）</label>
-    <select id="t_hint"><option value="true">开启</option><option value="false">关闭</option></select>
-    <button class="save" data-k="hint_enabled" data-t="t_hint">保存</button>
+    <label>访客编辑是否提醒我</label>
+    <input type="checkbox" class="chk" id="t_hint_visitor">
+    <button class="save" data-k="hint_on_visitor_edit" data-t="t_hint_visitor">保存</button>
+    <label>我编辑是否提醒访客</label>
+    <input type="checkbox" class="chk" id="t_hint_admin">
+    <button class="save" data-k="hint_on_admin_edit" data-t="t_hint_admin">保存</button>
+    <div class="hint">编辑同步成功后，对侧会出现一行「✍🏼已编辑」小提示（带「系统提示」按钮防伪）。上面两项分别控制两个方向。</div>
     <label>表情反应双向同步</label>
     <select id="t_reaction"><option value="true">开启</option><option value="false">关闭</option></select>
     <button class="save" data-k="reaction_sync_enabled" data-t="t_reaction">保存</button>
@@ -12360,7 +12452,7 @@ for (var i = 0; i < saveBtns.length; i++) {
       if (!confirm('关掉后主菜单里将不再有管理台入口。之后可私聊发送 /panel 临时打开管理台（链接 30 分钟内有效），确认关闭？')) return;
     }
     btn.disabled = true;
-    post('/api/config/set', { key: key, value: el.value }).then(function (d) {
+    post('/api/config/set', { key: key, value: el.type === 'checkbox' ? String(el.checked) : el.value }).then(function (d) {
       btn.disabled = false;
       if (d.ok) toast('已保存');
       else toast('保存失败：' + (d.error || ''));
@@ -12463,6 +12555,7 @@ fetch('/api/config?' + qs.toString())
     // （否则末尾的分区解隐与各渲染都执行不到、整页瘫痪）。
     function setVal(id, v) { var el = document.getElementById(id); if (el) el.value = v; }
     function setText(id, v) { var el = document.getElementById(id); if (el) el.textContent = v; }
+    function setChk(id, on) { var el = document.getElementById(id); if (el) el.checked = !!on; }
     if (!d.ok) {
       document.getElementById('loading').className = 'loadfail';
       setText('loading', '加载失败：无权访问或链接已过期，请回主菜单重新打开。');
@@ -12490,7 +12583,8 @@ fetch('/api/config?' + qs.toString())
     setVal('t_quizmax', d.quiz_max_attempts);
     setVal('t_quizlock', d.quiz_lock_min);
     setVal('t_stay', d.notice_stay_sec);
-    setVal('t_hint', d.hint_enabled ? 'true' : 'false');
+    setChk('t_hint_visitor', d.hint_on_visitor_edit);
+    setChk('t_hint_admin', d.hint_on_admin_edit);
     setVal('t_reaction', d.reaction_sync_enabled ? 'true' : 'false');
     setVal('t_relayfail', d.relay_fail_notice_enabled ? 'true' : 'false');
     setVal('t_blocknotice', d.block_notice_enabled ? 'true' : 'false');
@@ -12746,6 +12840,8 @@ function validateScalarConfig(key, rawValue) {
 
   const BOOL_KEYS = new Set([
     'hint_enabled',
+    'hint_on_visitor_edit',
+    'hint_on_admin_edit',
     'reaction_sync_enabled',
     'relay_fail_notice_enabled',
     'block_notice_enabled',
@@ -13009,6 +13105,18 @@ async function handleConfigApi(request, env) {
     cfg('keyword_responses', '[]')
   );
 
+  // 编辑提示双向开关的展示值：新键已存以新键为准，未存
+  // 时回退旧总开关 hint_enabled（与运行时门控同一口径）。
+  const hintShow = (key) => {
+    const own = cfgAll[key];
+
+    if (own !== undefined && own !== null) {
+      return own === 'true';
+    }
+
+    return (cfg('hint_enabled', 'true')) === 'true';
+  };
+
   return Response.json({
     ok: true,
     welcome_msg: cfg('welcome_msg'),
@@ -13058,6 +13166,10 @@ async function handleConfigApi(request, env) {
     notice_stay_sec: clampShow('notice_stay_sec', 5, 1, 120),
     hint_enabled:
       (cfg('hint_enabled', 'true')) === 'true',
+    hint_on_visitor_edit:
+      hintShow('hint_on_visitor_edit'),
+    hint_on_admin_edit:
+      hintShow('hint_on_admin_edit'),
     reaction_sync_enabled:
       (cfg('reaction_sync_enabled', 'true')) === 'true',
     relay_fail_notice_enabled:
@@ -13492,11 +13604,14 @@ async function handleUserListAction(request, env) {
   }
 
   if (action === 'reset') {
+    // 合并口径：重置连带清放行，与清信任一起回到未信任
+    // 状态，避免留下「显示已信任但实际未信任」的残标。
     await dbUserUpdate(
       targetId,
       {
         user_state: USER_STATE.PENDING,
-        is_trusted: 0
+        is_trusted: 0,
+        relay_exempt: 0
       },
       env
     );
@@ -13523,7 +13638,7 @@ async function handleUserListAction(request, env) {
     if (body?.trust === false) {
       await dbUserUpdate(
         targetId,
-        { is_trusted: 0 },
+        { is_trusted: 0, relay_exempt: 0 },
         env
       );
 
@@ -13554,7 +13669,7 @@ async function handleUserListAction(request, env) {
     if (target.user_state === USER_STATE.VERIFIED) {
       await dbUserUpdate(
         targetId,
-        { is_trusted: 1 },
+        { is_trusted: 1, relay_exempt: 1 },
         env
       );
 
@@ -13567,6 +13682,7 @@ async function handleUserListAction(request, env) {
       targetId,
       {
         is_trusted: 1,
+        relay_exempt: 1,
         user_state: USER_STATE.VERIFIED
       },
       env
@@ -13574,62 +13690,32 @@ async function handleUserListAction(request, env) {
 
     await cleanupAfterVerified(env, targetId);
 
-    try {
-      const successSent = await telegramApi(
-        env.BOT_TOKEN,
-        'sendMessage',
-        {
-          chat_id: targetId,
-          text: await textConfig(
-            'verify_success_text',
-            env
-          )
-        }
-      );
-
-      await trackSlotMessage(
-        env,
-        targetId,
-        'receipt_msg_id',
-        successSent?.message_id
-      );
-    } catch (error) {
-      console.error(
-        '发送信任验证成功提示失败：',
-        error?.message || error
-      );
-    }
+    await sendVerifySuccessReceipt(env, targetId);
 
     return Response.json({ ok: true });
   }
 
-  if (action === 'exempt') {
-    const target = await dbUserGet(targetId, env);
+  if (action === 'block') {
+    // 与 /ban、/unban 及资料卡完全同口径（统一生效
+    // 函数）：写标记并发在册的封禁/解封通知，不删话题。
+    if (body?.block === false) {
+      // 解封连带清零关键词命中计数（防旧计数再命中
+      // 一次即刻重封）。
+      await applyBlockState(targetId, false, env);
 
-    if (!target) {
-      return Response.json(
-        { ok: false, error: '访客记录不存在' },
-        { status: 400 }
-      );
+      return Response.json({ ok: true });
     }
 
-    if (
-      body?.exempt !== true &&
-      body?.exempt !== false
-    ) {
+    // 屏蔽参数 fail-closed：只有明确的 true 才屏蔽，
+    // 缺失或类型不对一律参数错误。
+    if (body?.block !== true) {
       return Response.json(
         { ok: false, error: '参数错误' },
         { status: 400 }
       );
     }
 
-    await dbUserUpdate(
-      targetId,
-      {
-        relay_exempt: body?.exempt ? 1 : 0
-      },
-      env
-    );
+    await applyBlockState(targetId, true, env);
 
     return Response.json({ ok: true });
   }
@@ -14002,17 +14088,11 @@ function render() {
       bp.textContent = '🎫 已发证 · 剩 ' + Math.max(1, Math.ceil((u.passExp - Date.now()) / 60000)) + ' 分钟';
       sub2.appendChild(bp);
     }
-    if (u.trusted) {
+    if (u.trusted || u.exempt) {
       var bt = document.createElement('span');
       bt.className = 'badge b-pass';
       bt.textContent = '🤝 已信任';
       sub2.appendChild(bt);
-    }
-    if (u.exempt) {
-      var bx = document.createElement('span');
-      bx.className = 'badge b-pass';
-      bx.textContent = '🕊 已放行';
-      sub2.appendChild(bx);
     }
     var t = document.createElement('span');
     t.textContent = '最近活跃 ' + fmt(u.updated_at);
@@ -14104,15 +14184,18 @@ function render() {
       };
       ops.appendChild(pb);
     }
+    var tOn = u.trusted || u.exempt;
     var tb = document.createElement('button');
     tb.className = 'ntb';
-    tb.textContent = u.trusted ? '↩️ 取消信任' : '🤝 信任';
+    tb.textContent = tOn ? '↩️ 取消信任' : '🤝 信任';
+    tb.title = '🤝 信任：免验证、免限流与类型过滤、免超时清理（关键词封禁仍生效）';
     tb.onclick = function () {
       tb.disabled = true;
-      act(u.id, 'trust', false, undefined, { trust: !u.trusted }).then(function (d) {
+      act(u.id, 'trust', false, undefined, { trust: !tOn }).then(function (d) {
         tb.disabled = false;
         if (d.ok) {
-          u.trusted = !u.trusted;
+          u.trusted = !tOn;
+          u.exempt = u.trusted;
           if (u.trusted) { u.state = 'verified'; u.passExp = 0; }
           toast(u.trusted ? '已设为信任，对方已通过验证' : '已取消信任');
           render();
@@ -14120,21 +14203,24 @@ function render() {
       });
     };
     ops.appendChild(tb);
-    var xb = document.createElement('button');
-    xb.className = 'ntb';
-    xb.textContent = u.exempt ? '↩️ 取消放行' : '🕊 放行';
-    xb.onclick = function () {
-      xb.disabled = true;
-      act(u.id, 'exempt', false, undefined, { exempt: !u.exempt }).then(function (d) {
-        xb.disabled = false;
+    var bOn = u.state === 'blocked';
+    var bb = document.createElement('button');
+    bb.className = 'ntb';
+    bb.textContent = bOn ? '✅ 解封' : '🚫 屏蔽';
+    bb.title = '屏蔽后对方发来的新消息会被立即删掉并丢弃，不再转发';
+    bb.onclick = function () {
+      bb.disabled = true;
+      act(u.id, 'block', false, undefined, { block: !bOn }).then(function (d) {
+        bb.disabled = false;
         if (d.ok) {
-          u.exempt = !u.exempt;
-          toast(u.exempt ? '已设为放行（免限流与类型过滤）' : '已取消放行');
+          if (!bOn) { u._st = u.state; u.state = 'blocked'; }
+          else { u.state = u._st || (u.passExp ? 'pending_verification' : 'verified'); delete u._st; }
+          toast(!bOn ? '已屏蔽该访客' : '已解除屏蔽');
           render();
         } else toast('操作失败：' + (d.error || ''));
       });
     };
-    ops.appendChild(xb);
+    ops.appendChild(bb);
     ops.appendChild(rb);
     var db = document.createElement('button');
     db.className = 'del';

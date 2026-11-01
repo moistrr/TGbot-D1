@@ -22,7 +22,7 @@
  *   的人会新建话题；reverify_ttl_days（温和版）到期只把已验证访客
  *   改回待验证，档案、备注与话题都保留，回来重验后还在原话题。
  * 功能清单（与仓库 README-增强版 条目对应）
- * Turnstile / 问答双验证与回退；管理员一次性通行证（网页访客列表发放，机器人私聊送达，30 分钟有效、凭 Telegram 身份确认、用后即焚，救济怎么也过不了验证的访客）；验证提示、通行证与成功回执都会记录消息 ID 并自动清理：通过验证即撤回提示与未用通行证，成功回执在首条消息转发成功后撤回，过期通行证在访客下次互动时清扫，状态类消息只保留最新一条；访客列表会显示待验证访客的通行证状态（已发证剩余分钟），发证动作返回到期时间并即时刷新行内徽标；第三轮三路审计修复：删人/重置/超时清理连带作废通行证、Turnstile 确认补封禁检查、删证与发证改原子条件操作、熔断到期通知与熔断回复改原子占用、验证提示加 3 分钟节流、反应镜像补访客状态检查、初始化错误不外泄细节、节流标记在验证成功/删人/超时清理时一并清掉；引用转发（含部分引用，三级降级）；
+ * Turnstile / 静态问答 / 顺序点击多验证方式与回退；管理员一次性通行证（网页访客列表发放，机器人私聊送达，30 分钟有效、凭 Telegram 身份确认、用后即焚，救济怎么也过不了验证的访客）；验证提示、通行证与成功回执都会记录消息 ID 并自动清理：通过验证即撤回提示与未用通行证，成功回执在首条消息转发成功后撤回，过期通行证在访客下次互动时清扫，状态类消息只保留最新一条；访客列表会显示待验证访客的通行证状态（已发证剩余分钟），发证动作返回到期时间并即时刷新行内徽标；第三轮三路审计修复：删人/重置/超时清理连带作废通行证、Turnstile 确认补封禁检查、删证与发证改原子条件操作、熔断到期通知与熔断回复改原子占用、验证提示加 3 分钟节流、反应镜像补访客状态检查、初始化错误不外泄细节、节流标记在验证成功/删人/超时清理时一并清掉；引用转发（含部分引用，三级降级）；
  * 反应双向同步；原地编辑同步 + 回复关联的 ✏️ 提示（Bot API 编辑
  * 无原生标记）；拉黑 / 取消拉黑提醒（my_chat_member + 403 兜底、
  * 标记去重）；/delete 按配对连带删除私聊原消息（原生删除无机器人
@@ -135,6 +135,7 @@ const USER_UPDATE_FIELDS = new Set([
   'admin_note',
   'verify_prompt_msg_id',
   'receipt_msg_id',
+  'welcome_msg_id',
   'is_trusted',
   'relay_exempt',
   'topic_creating',
@@ -504,8 +505,16 @@ async function telegramApi(
   token,
   method,
   params = {},
-  attempt = 0
+  attempt = 0,
+  stats = null
 ) {
+  // 可选子请求计数：传入 { n } 时每次实际尝试（含内部
+  // 重试的递归）在入口 +1，供有硬预算的调用方（如整段
+  // 清空）按真实子请求数计量；不传时零行为变化。
+  if (stats) {
+    stats.n = Number(stats.n || 0) + 1;
+  }
+
   const mayRetry = !NON_IDEMPOTENT_METHODS.has(method);
   const url =
     `https://api.telegram.org/bot${token}/${method}`;
@@ -529,7 +538,8 @@ async function telegramApi(
         token,
         method,
         params,
-        attempt + 1
+        attempt + 1,
+        stats
       );
     }
 
@@ -561,7 +571,8 @@ async function telegramApi(
         token,
         method,
         params,
-        attempt + 1
+        attempt + 1,
+        stats
       );
     }
 
@@ -589,7 +600,8 @@ async function telegramApi(
         token,
         method,
         params,
-        attempt + 1
+        attempt + 1,
+        stats
       );
     }
 
@@ -604,7 +616,8 @@ async function telegramApi(
         token,
         method,
         params,
-        attempt + 1
+        attempt + 1,
+        stats
       );
     }
 
@@ -759,6 +772,12 @@ async function dbMigrate(env) {
   await ensureUserColumn(
     env,
     'receipt_msg_id',
+    'INTEGER'
+  );
+
+  await ensureUserColumn(
+    env,
+    'welcome_msg_id',
     'INTEGER'
   );
 
@@ -1159,6 +1178,16 @@ async function cleanupExpiredUsers(env, now) {
 
     await dbConfigDelete(
       `promptat:${userId}`,
+      env
+    );
+
+    await dbConfigDelete(
+      `startmsg:${userId}`,
+      env
+    );
+
+    await dbConfigDelete(
+      `seq:${userId}`,
       env
     );
 
@@ -4296,13 +4325,22 @@ async function handleStart(
     env
   );
 
-  await telegramApi(
+  const welcomeSent = await telegramApi(
     env.BOT_TOKEN,
     'sendMessage',
     {
       chat_id: chatId,
       text: welcomeMessage
     }
+  );
+
+  // 欢迎语登记进槽位：重发 /start 时新换旧、只留最新一条；
+  // 验证成功时连同访客的 /start 一并撤回（见 cleanupAfterVerified）。
+  await trackSlotMessage(
+    env,
+    chatId,
+    'welcome_msg_id',
+    welcomeSent?.message_id
   );
 
   const mode =
@@ -4313,6 +4351,12 @@ async function handleStart(
       chatId,
       env,
       origin
+    );
+  } else if (mode === 'sequence') {
+    await sendSequencePrompt(
+      chatId,
+      env,
+      true
     );
   } else {
     const verificationQuestion =
@@ -4568,6 +4612,729 @@ async function handleVerification(
 }
 
 /* -------------------------------------------------------------------------- */
+/*                            顺序点击验证（新增）                              */
+/* -------------------------------------------------------------------------- */
+
+// 顺序点击：机器人发一条带 3×3 按钮盘的消息，访客按正文给出的
+// 顺序点完全部目标 emoji 即通过。题目与进度存 config 行 seq:<uid>
+// （{ t: 目标序列, p: 已完成步数, e: 过期毫秒戳 }）；盘面每次渲染
+// 都用同类干扰项重抽并洗牌；点错与静态问答共用同一套答错计数与
+// 锁定（quizlock:<uid>、recordQuizWrongAttempt、
+// quiz_max_attempts / quiz_lock_min 配置）。
+const SEQ_TTL_MS = 60000;
+
+// 类别表：每类 12 个互不相同、单码点（无变体选择符 / 组合序列）
+// 的 emoji，保证类内足够抽 9 个不重复按钮。
+const SEQ_EMOJI_CATEGORIES = [
+  // 水果
+  ['🍎', '🍌', '🍇', '🍊', '🍓', '🍉', '🍑', '🍒', '🍍', '🥝', '🍐', '🍋'],
+  // 动物
+  ['🐶', '🐱', '🐰', '🦊', '🐻', '🐼', '🐸', '🐵', '🐯', '🦁', '🐷', '🐮'],
+  // 食物
+  ['🍔', '🍕', '🍟', '🌮', '🍩', '🍦', '🍰', '🍿', '🧀', '🥐', '🍗', '🍜'],
+  // 车辆
+  ['🚗', '🚕', '🚙', '🚌', '🚓', '🚑', '🚒', '🚚', '🚛', '🚲', '🚀', '🚁'],
+  // 球类
+  ['⚽', '🏀', '🏈', '⚾', '🎾', '🏐', '🏉', '🎱', '🏓', '🏸', '🏒', '🥊'],
+  // 表情
+  ['😀', '😁', '😂', '🤣', '😊', '😍', '😎', '😐', '😴', '😜', '🤔', '🙂']
+];
+
+function shuffleCopy(list) {
+  const arr = [...list];
+
+  for (let i = arr.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
+  }
+
+  return arr;
+}
+
+function seqCategoryOf(emoji) {
+  return (
+    SEQ_EMOJI_CATEGORIES.find((cat) =>
+      cat.includes(emoji)
+    ) || SEQ_EMOJI_CATEGORIES[0]
+  );
+}
+
+// 随机抽一个类别、4 或 5 个不重复的目标 emoji。
+function newSeqTargets() {
+  const cat =
+    SEQ_EMOJI_CATEGORIES[
+      Math.floor(
+        Math.random() * SEQ_EMOJI_CATEGORIES.length
+      )
+    ];
+  const pool = shuffleCopy(cat);
+  const count = 4 + Math.floor(Math.random() * 2);
+
+  return pool.slice(0, count);
+}
+
+// 渲染第 p 步：正文列出完整序列（已完成标 ✅）与进度 x/N；
+// 盘面 = 剩余目标 + 同类干扰（不含任何目标）补足 9 个、洗牌。
+// 按钮 callback_data 带当前步数 p：点对后 p 前进，
+// 旧盘面按钮随之过期，连点与重放不会重复计数。
+function renderSeqChallenge(state) {
+  const targets = state.t;
+  const done = state.p;
+  const total = targets.length;
+  const category = seqCategoryOf(targets[0]);
+  const remaining = targets.slice(done);
+  const distractors = shuffleCopy(
+    category.filter((e) => !targets.includes(e))
+  ).slice(0, 9 - remaining.length);
+  const board = shuffleCopy([
+    ...remaining,
+    ...distractors
+  ]);
+
+  const seqText = targets
+    .map((e, i) => (i < done ? '✅' : e))
+    .join(' → ');
+  const text =
+    '🧩 顺序点击验证\n' +
+    `请按顺序点击：${seqText}\n` +
+    `进度 ${done}/${total}，请在 60 秒内点完。`;
+
+  const keyboard = [];
+
+  for (let r = 0; r < 3; r += 1) {
+    keyboard.push(
+      board.slice(r * 3, r * 3 + 3).map((e) => ({
+        text: e,
+        callback_data: `seq:${done}:${e}`
+      }))
+    );
+  }
+
+  return {
+    text,
+    reply_markup: { inline_keyboard: keyboard }
+  };
+}
+
+// 解析顺序点击题目状态行：形状不对一律视为无题。
+// 回调路径要拿原始串做 CAS，解析与读取分开。
+function parseSeqState(raw) {
+  if (!raw) {
+    return null;
+  }
+
+  let state = null;
+
+  try {
+    state = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+
+  if (
+    !state ||
+    !Array.isArray(state.t) ||
+    state.t.length === 0 ||
+    !Number.isInteger(state.p) ||
+    state.p < 0 ||
+    state.p >= state.t.length ||
+    !Number(state.e)
+  ) {
+    return null;
+  }
+
+  return state;
+}
+
+async function readSeqState(userId, env) {
+  const raw = await dbConfigGet(
+    `seq:${userId}`,
+    env
+  );
+
+  return parseSeqState(raw);
+}
+
+// seq 状态行 CAS 写：值仍是读到的那份才写。已被并发
+// 改动 → 返回 false，调用方静默收尾（对方那一路已
+// 处理）；与问答计数同口径，CAS 失败而值未变时兜底
+// 无条件写一次（个别存储层对条件写返回怪异时，
+// 正常点击不至于失效）。
+async function casSeqWrite(key, baseRaw, newRaw, env) {
+  if (
+    await dbConfigPutIfValue(key, baseRaw, newRaw, env)
+  ) {
+    return true;
+  }
+
+  const current = await dbConfigGet(key, env);
+
+  if (current !== baseRaw) {
+    return false;
+  }
+
+  await dbConfigPut(key, newRaw, env);
+
+  return true;
+}
+
+// seq 状态行 CAS 占用（完成支）：值仍是读到的那份
+// 才删；抢到的一方才跑验证成功副作用，防同一步
+// 并发双发成功回执。失败回退口径同 casSeqWrite。
+async function claimSeqRow(key, baseRaw, env) {
+  if (
+    await dbConfigDeleteIfValue(key, baseRaw, env)
+  ) {
+    return true;
+  }
+
+  const current = await dbConfigGet(key, env);
+
+  if (current !== baseRaw) {
+    return false;
+  }
+
+  await dbConfigDelete(key, env);
+
+  return true;
+}
+
+// 与问答共用的锁定状态读取（quizlock:<uid>）。
+async function readQuizLock(userId, env) {
+  const raw = await dbConfigGet(
+    `quizlock:${userId}`,
+    env
+  );
+
+  let state = null;
+
+  try {
+    state = raw ? JSON.parse(raw) : null;
+  } catch {
+    state = null;
+  }
+
+  const locked =
+    !!state &&
+    Number(state.until || 0) > Date.now();
+
+  return { raw, state, locked };
+}
+
+// 发送顺序点击题目。入口分两种：/start 链
+// （viaStart=true）与待验证文字兜底（viaStart=false）。
+// 出题前先看有没有活题：未过期未完成的题目直接沿用，
+// 任何入口都不重发——题目由回调驱动续命，顶掉进度只会
+// 让访客困惑（节流窗口 180 秒长于题目 60 秒，曾出现
+// 两种错位：题过期后 /start 被节流静默不出新题；文字
+// 兜底在节流过后以新题覆盖已点进度）。
+// 锁定中不出新题：问答锁定期间 /start 只是重发静态题面
+// 文本、作答被静默拒绝；顺序点击的题目即服务端状态，
+// 无法只发题面，故锁定中只发与问答同文案的锁定提示
+// （登记进槽位，解锁后访客重发 /start 即被新题替换），
+// 不建 seq 行；锁定提示的节流与登记口径不变，时长报
+// 剩余而非整段（见锁定分支）。
+// 节流只约束文字兜底：/start 是访客被回调文案明确
+// 指引的恢复动作，题死后必须立刻能拿到新题，不受
+// 3 分钟节流限制；出题后照常登记 promptat。
+async function sendSequencePrompt(
+  chatId,
+  env,
+  viaStart = false
+) {
+  const existing = await readSeqState(chatId, env);
+
+  if (existing && Number(existing.e) > Date.now()) {
+    return;
+  }
+
+  const lock = await readQuizLock(chatId, env);
+
+  if (lock.locked) {
+    if (await promptThrottled(env, chatId)) {
+      return;
+    }
+
+    const quizLockMin = await clampedIntConfig(
+      'quiz_lock_min',
+      env,
+      30,
+      1,
+      1440
+    );
+
+    // 报剩余时长：until 是锁定时写下的到期戳，现成
+    // 可算；缺失/已过期等异常形状回退配置全长。
+    const untilMs = Number(lock.state?.until || 0);
+
+    const remainMin =
+      untilMs > Date.now()
+        ? Math.max(
+            1,
+            Math.ceil((untilMs - Date.now()) / 60000)
+          )
+        : quizLockMin;
+
+    const sent = await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: chatId,
+        text:
+          '🚫 答错次数过多，验证已锁定 ' +
+          `${remainMin} 分钟，请稍后再试。`
+      }
+    );
+
+    await trackSlotMessage(
+      env,
+      chatId,
+      'verify_prompt_msg_id',
+      sent?.message_id
+    );
+
+    await markPromptSent(env, chatId);
+
+    return;
+  }
+
+  if (!viaStart && (await promptThrottled(env, chatId))) {
+    return;
+  }
+
+  const state = {
+    t: newSeqTargets(),
+    p: 0,
+    e: Date.now() + SEQ_TTL_MS
+  };
+
+  await dbConfigPut(
+    `seq:${chatId}`,
+    JSON.stringify(state),
+    env
+  );
+
+  const view = renderSeqChallenge(state);
+
+  const sent = await telegramApi(
+    env.BOT_TOKEN,
+    'sendMessage',
+    {
+      chat_id: chatId,
+      text: view.text,
+      reply_markup: view.reply_markup
+    }
+  );
+
+  await trackSlotMessage(
+    env,
+    chatId,
+    'verify_prompt_msg_id',
+    sent?.message_id
+  );
+
+  await markPromptSent(env, chatId);
+}
+
+// 把题目视图呈现到当前消息上：优先原地编辑；消息已不可编辑
+// （被访客删掉等）时另发一条新题并更新槽位，状态行沿用。
+// 返回是否呈现成功；编辑与补发双双失败也只返回 false、
+// 不抛异常（调用方已先写好状态，抛出会让回调无应答）。
+async function presentSeqView(
+  userId,
+  messageId,
+  view,
+  env
+) {
+  if (messageId) {
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'editMessageText',
+        {
+          chat_id: userId,
+          message_id: Number(messageId),
+          text: view.text,
+          reply_markup: view.reply_markup
+        }
+      );
+
+      return true;
+    } catch {
+      /* 落到下方另发新题 */
+    }
+  }
+
+  // 补发也包 try：编辑与补发双双失败时只记日志、返回
+  // false，绝不让异常逃出回调处理——状态已经推进，
+  // 访客可等题过期后 /start 恢复（回调层另有兜底应答）。
+  try {
+    const sent = await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: userId,
+        text: view.text,
+        reply_markup: view.reply_markup
+      }
+    );
+
+    await trackSlotMessage(
+      env,
+      userId,
+      'verify_prompt_msg_id',
+      sent?.message_id
+    );
+
+    return true;
+  } catch (error) {
+    console.error(
+      '呈现顺序点击题目失败：',
+      error?.message || error
+    );
+
+    return false;
+  }
+}
+
+async function handleSequenceCallback(
+  callbackQuery,
+  env
+) {
+  const senderId =
+    String(callbackQuery.from.id);
+  const data = String(callbackQuery.data || '');
+  const parts = data.split(':');
+  const step = Number(parts[1]);
+  const emoji = parts.slice(2).join(':');
+  const messageId =
+    callbackQuery.message?.message_id;
+
+  // 统一应答出口：每条回调只应答一次。整体包一层
+  // try/catch（见函数尾）：盘面呈现等环节异常时也要
+  // 补上应答，否则访客端按钮一直转圈到超时。
+  let answered = false;
+
+  const ans = async (text = '', showAlert = false) => {
+    if (answered) {
+      return;
+    }
+
+    answered = true;
+
+    await answerCallback(
+      callbackQuery.id,
+      env,
+      text,
+      showAlert
+    );
+  };
+
+  try {
+    const user = await dbUserGet(senderId, env);
+
+    // 无档案或已封禁：静默确认，不给任何反馈。
+    if (!user || user.is_blocked) {
+      await ans();
+      return;
+    }
+
+    if (
+      user.user_state === USER_STATE.VERIFIED
+    ) {
+      await ans('✅ 您已通过验证。', true);
+
+      return;
+    }
+
+    // 锁定中静默：与问答锁定期间提交答案的口径一致
+    // （不回复内容、不计数），且锁定触发时 seq 行已删，
+    // 必须先于「无题目」分支判断，否则会误报过期。
+    const lock = await readQuizLock(senderId, env);
+
+    if (lock.locked) {
+      await ans();
+      return;
+    }
+
+    const seqKey = `seq:${senderId}`;
+
+    // 验证方式已被管理员切走：在途题目立即作废——按
+    // 旧题答完不能绕过新方式（与通行证、重置的换代
+    // 作废口径一致）。
+    if (
+      (await getEffectiveVerifyMode(env)) !== 'sequence'
+    ) {
+      await dbConfigDelete(seqKey, env);
+
+      await ans();
+
+      return;
+    }
+
+    // 必须点的是当前登记的那条题目消息：旧盘面的删除
+    // 是尽力而为、可能残留，点到旧盘面一律静默，不拿
+    // 新题状态去判旧答案（不奖不罚不计数）。
+    const promptMsgId = Number(
+      user.verify_prompt_msg_id || 0
+    );
+
+    if (
+      !promptMsgId ||
+      Number(messageId || 0) !== promptMsgId
+    ) {
+      await ans();
+
+      return;
+    }
+
+    // 读状态时保留原始串：后续写回走 CAS（casSeqWrite
+    // / claimSeqRow），同一步并发回调只有一路能推进。
+    const raw = await dbConfigGet(seqKey, env);
+    const state = parseSeqState(raw);
+
+    if (!state || Number(state.e) <= Date.now()) {
+      if (state) {
+        await dbConfigDelete(seqKey, env);
+      }
+
+      await ans(
+        '⌛ 这道题已过期，重新发送 /start 换一道。',
+        true
+      );
+
+      return;
+    }
+
+    // 步数对不上 = 旧盘面的过期点击（已完成的那一步被连点
+    // 或重放）：静默确认，不奖不罚。
+    if (step !== state.p) {
+      await ans();
+      return;
+    }
+
+    if (emoji === state.t[state.p]) {
+      const next = { ...state, p: state.p + 1 };
+
+      if (next.p >= state.t.length) {
+        // 全部点完：先 CAS 占用题目行，抢到的一方才跑
+        // 验证成功副作用（与问答成功同路径——清计数、
+        // 置已验证、统一收尾、发成功回执并登记回执
+        // 槽位），防同一步并发双发成功回执。
+        const claimed = await claimSeqRow(
+          seqKey,
+          raw,
+          env
+        );
+
+        if (!claimed) {
+          await ans();
+
+          return;
+        }
+
+        await dbConfigDelete(
+          `quizlock:${senderId}`,
+          env
+        );
+
+        await dbUserUpdate(
+          senderId,
+          { user_state: USER_STATE.VERIFIED },
+          env
+        );
+
+        await cleanupAfterVerified(env, senderId);
+
+        const successSent = await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: senderId,
+            text: await textConfig(
+              'verify_success_text',
+              env
+            )
+          }
+        );
+
+        await trackSlotMessage(
+          env,
+          senderId,
+          'receipt_msg_id',
+          successSent?.message_id
+        );
+
+        await ans('🎉 验证通过！');
+
+        return;
+      }
+
+      const wrote = await casSeqWrite(
+        seqKey,
+        raw,
+        JSON.stringify(next),
+        env
+      );
+
+      if (!wrote) {
+        await ans();
+
+        return;
+      }
+
+      await presentSeqView(
+        senderId,
+        messageId,
+        renderSeqChallenge(next),
+        env
+      );
+
+      await ans(`✅ ${next.p}/${state.t.length}`);
+
+      return;
+    }
+
+    // 点错：与问答共用答错计数（CAS）与锁定。
+    const quizMaxAttempts =
+      await clampedIntConfig(
+        'quiz_max_attempts',
+        env,
+        5,
+        1,
+        20
+      );
+
+    const quizLockMin = await clampedIntConfig(
+      'quiz_lock_min',
+      env,
+      30,
+      1,
+      1440
+    );
+
+    const attempts = await recordQuizWrongAttempt(
+      `quizlock:${senderId}`,
+      lock.raw,
+      lock.state,
+      quizMaxAttempts,
+      quizLockMin,
+      env
+    );
+
+    if (attempts === -1) {
+      await ans();
+      return;
+    }
+
+    const lockText =
+      '🚫 答错次数过多，验证已锁定 ' +
+      `${quizLockMin} 分钟，请稍后再试。`;
+
+    if (attempts >= quizMaxAttempts) {
+      await dbConfigDelete(seqKey, env);
+
+      // 题目消息原地改成锁定提示（无键盘）；编辑失败则另发
+      // 一条并登记槽位，保证访客眼前留有一条锁定说明。
+      let edited = false;
+
+      if (messageId) {
+        try {
+          await telegramApi(
+            env.BOT_TOKEN,
+            'editMessageText',
+            {
+              chat_id: senderId,
+              message_id: Number(messageId),
+              text: lockText
+            }
+          );
+
+          edited = true;
+        } catch {
+          edited = false;
+        }
+      }
+
+      if (!edited) {
+        const sent = await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: senderId,
+            text: lockText
+          }
+        );
+
+        await trackSlotMessage(
+          env,
+          senderId,
+          'verify_prompt_msg_id',
+          sent?.message_id
+        );
+      }
+
+      await ans(lockText, true);
+
+      return;
+    }
+
+    // 未锁定：整题重开（新类别、新目标、新盘面、新 60 秒），
+    // 编辑当前消息呈现；点错提示复用问答的 quiz_wrong_text，
+    // 并带上剩余机会。状态写走 CAS：并发已改（对方那一路
+    // 已推进或已完成）时不覆盖、不重复呈现。
+    const fresh = {
+      t: newSeqTargets(),
+      p: 0,
+      e: Date.now() + SEQ_TTL_MS
+    };
+
+    const wrote = await casSeqWrite(
+      seqKey,
+      raw,
+      JSON.stringify(fresh),
+      env
+    );
+
+    if (!wrote) {
+      await ans();
+
+      return;
+    }
+
+    await presentSeqView(
+      senderId,
+      messageId,
+      renderSeqChallenge(fresh),
+      env
+    );
+
+    const wrongText = await textConfig(
+      'quiz_wrong_text',
+      env
+    );
+
+    await ans(
+      `${wrongText}（还可尝试 ${
+        quizMaxAttempts - attempts
+      } 次）`.slice(0, 190),
+      true
+    );
+  } catch (error) {
+    console.error(
+      '顺序点击回调处理失败：',
+      error?.message || error
+    );
+
+    if (!answered) {
+      await ans('⚠️ 处理失败，请重新发送 /start。', true);
+    }
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /*                    Turnstile 小程序验证（改版新增）                          */
 /* -------------------------------------------------------------------------- */
 
@@ -4662,6 +5429,15 @@ async function getEffectiveVerifyMode(env) {
     'turnstile'
   );
 
+  // 顺序点击不依赖 Turnstile 密钥，独立成档。
+  if (mode === 'sequence') {
+    return 'sequence';
+  }
+
+  if (mode === 'quiz') {
+    return 'quiz';
+  }
+
   if (
     mode === 'turnstile' &&
     isTurnstileConfigured(env)
@@ -4669,6 +5445,7 @@ async function getEffectiveVerifyMode(env) {
     return 'turnstile';
   }
 
+  // turnstile 未配密钥时仍回退静态问答（原有口径不变）。
   return 'quiz';
 }
 
@@ -4896,7 +5673,7 @@ async function quietDeleteMessage(env, chatId, messageId) {
   }
 }
 
-// 记账槽位：column 为 verify_prompt_msg_id / receipt_msg_id。
+// 记账槽位：column 为 verify_prompt_msg_id / receipt_msg_id / welcome_msg_id。
 // 写入新 ID 前先删掉槽里的旧消息，保证同类消息只留最新一条。
 async function trackSlotMessage(env, userId, column, messageId) {
   if (!messageId) {
@@ -4951,7 +5728,9 @@ async function voidUserPass(env, userId) {
 }
 
 // 任意入口验证通过后的联动清理：撤回验证提示；
-// 若还有未使用的通行证，一并删消息并作废（人已通过，证留着只是风险）。
+// 若还有未使用的通行证，一并删消息并作废（人已通过，证留着只是风险）；
+// 欢迎语与访客那条 /start 的使命也到此结束，一并撤回，
+// 私聊里只留成功回执（回执仍按原口径留到第一条正文转发后再删）。
 async function cleanupAfterVerified(env, userId) {
   await clearSlotMessage(
     env,
@@ -4962,6 +5741,30 @@ async function cleanupAfterVerified(env, userId) {
   await voidUserPass(env, userId);
 
   await dbConfigDelete(`promptat:${userId}`, env);
+
+  await clearSlotMessage(
+    env,
+    userId,
+    'welcome_msg_id'
+  );
+
+  const startMsgId = Number(
+    (await dbConfigGet(`startmsg:${userId}`, env)) || 0
+  );
+
+  if (startMsgId) {
+    await quietDeleteMessage(env, userId, startMsgId);
+  }
+
+  await dbConfigDelete(`startmsg:${userId}`, env);
+
+  // 答错计数与在途题目一并清：五条验证成功路径
+  // （问答/顺序点击/Turnstile/通行证/设信任）都经
+  // 本函数收尾，在此一处收口，免得残留计数或旧题
+  // 在访客日后被重置回待验证时继续生效。
+  await dbConfigDelete(`quizlock:${userId}`, env);
+
+  await dbConfigDelete(`seq:${userId}`, env);
 }
 
 // 过期通行证清扫：访客下次互动时顺手删掉过期通行证消息并清记录。
@@ -5477,15 +6280,65 @@ const CONFIRM_TRY_MAX = 20;
 
 async function confirmTryAllowed(env, keyPrefix, userId) {
   const key = `${keyPrefix}:${userId}`;
+  let raw = await dbConfigGet(key, env);
+
+  // CAS 计数（与问答答错计数同模式）：读原始串 → 条件
+  // 写，冲突就重读重试；裸读-加-写在并发下会互相覆盖、
+  // 把实际上限放大成「上限 × 并发度」。
+  for (let casTry = 0; casTry < 5; casTry += 1) {
+    const now = Date.now();
+
+    let rec = null;
+
+    try {
+      rec = safeJsonParse(raw, null);
+    } catch {
+      rec = null;
+    }
+
+    if (
+      !rec ||
+      typeof rec !== 'object' ||
+      !Number(rec.w) ||
+      now - Number(rec.w) >= CONFIRM_TRY_WINDOW_MS
+    ) {
+      rec = { n: 0, w: now };
+    }
+
+    rec.n = Number(rec.n || 0) + 1;
+
+    const nextValue = JSON.stringify(rec);
+
+    let wrote = false;
+
+    if (raw === null || raw === undefined) {
+      // 行不存在：原子占用创建（与问答计数
+      // recordQuizWrongAttempt 的创建路径同原语）。
+      wrote = await dbConfigClaim(key, nextValue, env);
+    } else {
+      wrote = await dbConfigPutIfValue(
+        key,
+        raw,
+        nextValue,
+        env
+      );
+    }
+
+    if (wrote) {
+      return rec.n <= CONFIRM_TRY_MAX;
+    }
+
+    raw = await dbConfigGet(key, env);
+  }
+
+  // 多次冲突后兜底：以最新读到的计数无条件写入
+  // （尽力而为，与问答计数同口径）。
   const now = Date.now();
 
   let rec = null;
 
   try {
-    rec = safeJsonParse(
-      await dbConfigGet(key, env),
-      null
-    );
+    rec = safeJsonParse(raw, null);
   } catch {
     rec = null;
   }
@@ -6297,6 +7150,17 @@ async function handlePrivateMessage(
         noticeSent?.message_id
       );
     } else {
+      // 记下这条 /start 的编号（只记最新一条）：验证成功时
+      // 连同欢迎语一并撤回（见 cleanupAfterVerified）。
+      // /help 同样会走 handleStart，但清理对象是 /start 本身，不记。
+      if (commandText === '/start' && message.message_id) {
+        await dbConfigPut(
+          `startmsg:${userId}`,
+          String(message.message_id),
+          env
+        );
+      }
+
       await handleStart(chatId, env, origin);
     }
 
@@ -6564,6 +7428,18 @@ async function handlePrivateMessage(
         chatId,
         env,
         origin
+      );
+
+      return;
+    }
+
+    if (mode === 'sequence') {
+      // 顺序点击模式下文字不是答案：不进问答判题，
+      // 走文字兜底口径唤起题目（sendSequencePrompt 内有
+      // 活题保护、节流与锁定处理），与 Turnstile 分支同构。
+      await sendSequencePrompt(
+        chatId,
+        env
       );
 
       return;
@@ -7155,6 +8031,9 @@ async function handleAdminCommand(
     );
 
     await voidUserPass(env, userId);
+
+    // 在途顺序点击题目一并作废（与作废通行证同口径）。
+    await dbConfigDelete(`seq:${userId}`, env);
 
     await sendEphemeralTopicNotice(
       message,
@@ -8792,6 +9671,20 @@ async function handleCallbackQuery(
   const senderId =
     String(callbackQuery.from.id);
 
+  const data =
+    String(callbackQuery.data || '');
+
+  // 顺序点击验证的按钮属于待验证访客，须在管理员校验
+  // 之前分发；其余回调仍仅限管理员（见下方校验）。
+  if (data.startsWith('seq:')) {
+    await handleSequenceCallback(
+      callbackQuery,
+      env
+    );
+
+    return;
+  }
+
   const isAdmin =
     await isAdminUser(senderId, env);
 
@@ -8805,9 +9698,6 @@ async function handleCallbackQuery(
 
     return;
   }
-
-  const data =
-    String(callbackQuery.data || '');
 
   if (data === 'menu:main') {
     await answerCallback(
@@ -9341,9 +10231,10 @@ async function collectConversationMessageIds(
 // 定性），不再一失败就整批 100 条逐条删——批里只有一两
 // 条删不掉时，逐条退化要烧上百次调用；二分只需对数级。
 // 「消息不存在」按既有口径视为已删。
-// 可选 budget（{ calls, limit }）：每次 telegramApi 调用
-// 计一次（其内部重试不另计），预算耗尽即停，返回
-// complete=false，供上层停在块边界分次推进。
+// 可选 budget（{ stats, limit }）：stats 是与 telegramApi
+// 共享的尝试计数 { n }——按真实子请求计（含其内部重试，
+// 不再是「每次逻辑调用计一次」的名义口径），预算耗尽
+// 即停，返回 complete=false，供上层停在块边界分次推进。
 async function deleteMessagesCounted(
   env,
   chatId,
@@ -9359,12 +10250,8 @@ async function deleteMessagesCounted(
       return;
     }
 
-    if (budget && budget.calls >= budget.limit) {
+    if (budget && budget.stats.n >= budget.limit) {
       return;
-    }
-
-    if (budget) {
-      budget.calls += 1;
     }
 
     try {
@@ -9374,7 +10261,9 @@ async function deleteMessagesCounted(
         {
           chat_id: chatId,
           message_ids: chunk
-        }
+        },
+        0,
+        budget ? budget.stats : null
       );
 
       ok += chunk.length;
@@ -9419,7 +10308,8 @@ async function deleteMessagesCounted(
 // 按「组」推进（每 50 组一块）：本组双边都删过，才删
 // 本组的记录行（仍只删收集快照里的行——清空期间新到
 // 的消息配对不在快照内，不受影响）。全部删除调用计入
-// 同一份预算（约 40 次）：大体量会话一轮删不完时停在
+// 同一份预算（40 次真实子请求，含删除调用的内部重试）：
+// 大体量会话一轮删不完时停在
 // 组边界，剩余组的记录原样保留，返回 partial/remaining，
 // 管理员再执行一次 /clear 就能接着删（确认占用按确认
 // 消息编号，新确认照常能占上，不会卡死）。
@@ -9434,7 +10324,7 @@ async function wipeConversationCopies(
       env
     );
 
-  const budget = { calls: 0, limit: 40 };
+  const budget = { stats: { n: 0 }, limit: 40 };
 
   let priv = { ok: 0, failed: 0 };
   let topic = { ok: 0, failed: 0 };
@@ -9443,7 +10333,7 @@ async function wipeConversationCopies(
   for (let i = 0; i < units.length; i += 50) {
     const group = units.slice(i, i + 50);
 
-    if (budget.calls >= budget.limit) {
+    if (budget.stats.n >= budget.limit) {
       remaining = units.length - i;
 
       break;
@@ -9823,6 +10713,16 @@ async function purgeManagedUser(
     env
   );
 
+  await dbConfigDelete(
+    `startmsg:${userId}`,
+    env
+  );
+
+  await dbConfigDelete(
+    `seq:${userId}`,
+    env
+  );
+
   return topicDeleted;
 }
 
@@ -9830,7 +10730,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.2.3';
+const BOT_VERSION = 'v1.3.0';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -10902,12 +11802,13 @@ function buildGuidePage() {
     <ul>
       <li><b class=\"k\">Turnstile 小程序验证（推荐）：</b>访客点「开始验证」按钮，弹出一个小页面自动完成人机校验，几秒通过，体验最顺。验证链接绑定访客本人，必须在 Telegram 里点开，转发给别人或用浏览器打开都用不了。</li>
       <li><b class=\"k\">静态问答验证：</b>你出一道题，访客答对才放行；答案可以准备多个，用竖线 <code>|</code> 分隔，答中任意一个都算对。连着答错 5 次会被锁定 30 分钟（防有人对着答案穷举），锁定期间他发什么都不会有回应，过后自动解锁。次数和时长可以在管理台「基础配置」里改。</li>
-      <li><b class=\"k\">在哪里切换：</b>网页管理台 → 基础配置 → 验证方式。选了 Turnstile 后，问题和答案两项会自动隐藏；如果还没配好 Turnstile 密钥，机器人会自动用问答模式兜底，不会把人卡死。</li>
+            <li><b class=\"k\">顺序点击验证：</b>不用打开网页、也不用打字：机器人发一条带九宫格按钮的消息，访客按正文给出的顺序、在 60 秒内点完 4–5 个同类 emoji 即通过；每点对一个，盘面会重新洗牌；点错会换一整道新题，连错锁定与静态问答共用同一套次数与时长设置。</li>
+<li><b class=\"k\">在哪里切换：</b>网页管理台 → 基础配置 → 验证方式。选了 Turnstile 后，问题和答案两项会自动隐藏；如果还没配好 Turnstile 密钥，机器人会自动用问答模式兜底，不会把人卡死。</li>
       <li><b class=\"k\">让某人重新验证：</b>打开他的话题，发送 <code>/reverify</code>，他下一次发消息前要重新过一遍验证。</li>
       <li><b class=\"k\">自己先试一遍：</b>私聊发送 <code>/testverify</code> 会拿到一个测试验证链接，点开能看到访客眼中的验证页长什么样；测试模式只是看看样子，不会真的放行或记录任何人。</li>
       <li><b class=\"k\">🎫 一次性通行证（救济通道）：</b>个别访客怎么也过不了验证（比如网络连不上验证服务）时，在访客列表里他那一行点「🎫 通行证」，机器人会私聊发给他一张通行证（默认 30 分钟内有效，有效期可在管理台「基础配置」里改），他点开确认即通过验证。通行证必须本人点开才有效，转发给别人没用，用过即作废；不依赖 Turnstile 配置，没配密钥也能发。</li>
       <li><b class=\"k\">🤝 信任（免验证）：</b>熟人可以免掉验证：在访客列表他那一行点「🤝 信任」，或在他话题的资料卡上点「设为信任」，他立即通过验证（会收到验证成功提示），以后也一直免验证；点「取消信任」收回。注意：对他「重置验证」或在话题里发 /reverify 会连信任一起撤销；被封禁的人要先解封才能设信任；资料卡上的信任按钮只有主管理员能操作。</li>
-      <li><b class=\"k\">验证消息会自己清理：</b>验证提示、通行证和「🎉 验证成功」这类流程消息，用完后会被机器人自动删掉，不在访客对话里堆积：反复索要验证只留最新一条提示，通过验证时提示立即清掉，成功提示等他第一条正经消息送达后再删；过期没用的通行证会在他下次来发消息时清扫。</li>
+      <li><b class=\"k\">验证消息会自己清理：</b>验证提示、欢迎消息、通行证和「🎉 验证成功」这类流程消息，用完后会被机器人自动删掉，不在访客对话里堆积：反复索要验证只留最新一条提示，通过验证时提示、欢迎消息和访客自己发的那条 /start 会一并清掉，成功提示等他第一条正经消息送达后再删；过期没用的通行证会在他下次来发消息时清扫。</li>
     </ul>
   </section>
 
@@ -10923,7 +11824,7 @@ function buildGuidePage() {
       <li><b class=\"k\">拉黑有提醒：</b>访客把机器人拉黑时，他的话题里会出现 🚫 提醒；他取消拉黑时有 ✅ 提醒，不用你去猜他还在不在；发出 ✅ 提醒的同时，之前那条 🚫 提醒会被一并删掉，话题里只留最新状态。</li>
       <li><b class=\"k\">转发失败有提醒：</b>极少数消息（比如带内容保护的内容）机器人复制不了、转不进话题时，会在话题里留一行 ⚠️ 提醒你留意（对方还以为发送成功了）；要是在群里手动关闭了某个话题，访客再发消息时机器人会先把话题重新打开再投递，不会另建新话题；访客短时间内发得太频繁时，超出部分会被限流丢弃，并在话题里提醒一次。</li>
       <li><b class=\"k\">命令回执不留痕：</b>你在话题里发出的命令消息，会在处理后立即被撤回；/note 的查看与保存、/notedelete、/reverify、/ban、/unban、/card 重建、话题里 /pause 与 /resume 的结果提示，还有打错命令时的「未识别的命令」提示，都是短暂显示，约 5 秒后自动删除，话题里不会堆积这类回执。例外：/note 保存失败（比如备注超长）时，命令原文会保留下来，方便你照着改短了重发。</li>
-      <li><b class=\"k\">被轰炸时先开启服务熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客新发的消息会被机器人当场删除、不补送——消息发出去就消失，就是还在暂停的信号；对熔断前已送达消息的编辑和反应照常同步到话题副本，两边记录保持一致；开启服务熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息；恢复服务时，那条「请稍后再试」会自动改成「✅ 服务已恢复」，访客一看便知。到期自动恢复（恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的），也可随时 <code>/resume</code> 提前恢复。</li>
+      <li><b class=\"k\">被轰炸时先开启服务熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客新发的消息会被机器人当场删除、不补送——消息发出去就消失，就是还在暂停的信号；对熔断前已送达消息的编辑和反应照常同步到话题副本，两边记录保持一致；开启服务熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息；恢复服务时，那条「请稍后再试」会自动改成「✅ 服务已恢复」，访客一看便知（暂停期间收到这条回复的人很多时，会在恢复后的头几条消息里分批改完）。到期自动恢复（恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的），也可随时 <code>/resume</code> 提前恢复。</li>
     </ul>
   </section>
 
@@ -10993,7 +11894,7 @@ function buildGuidePage() {
     <p class=\"q\">贴的表情为什么显示成机器人贴的？</p>
     <p>Telegram 只允许机器人以自己的名义贴表情，同步到对方那边自然显示机器人名字，这个改不了。</p>
     <p class=\"q\">访客说验证一直过不了，怎么办？</p>
-    <p>先让他换个网络或重启 App 再试。还是不行，就给他发一张一次性通行证：打开访客列表，在他那一行点「🎫 通行证」，机器人会私聊发给他一张 30 分钟有效的通行证，他点开确认就能通过，不用再折腾验证。你也可以发 /testverify 自己点一遍，看看验证页是否正常，或者在管理台临时把验证方式切成静态问答，让他先通过。</p>
+    <p>先让他换个网络或重启 App 再试。还是不行，就给他发一张一次性通行证：打开访客列表，在他那一行点「🎫 通行证」，机器人会私聊发给他一张 30 分钟有效的通行证，他点开确认就能通过，不用再折腾验证。你也可以发 /testverify 自己点一遍，看看验证页是否正常，或者在管理台临时把验证方式切成静态问答或顺序点击，让他先通过。</p>
     <p class=\"q\">网页打开提示「链接无效或已过期」？</p>
     <p>管理台、访客列表和这本引导的链接都是 30 分钟有效的签名链接：打开时报错、或者页面开久了点保存提示「链接已过期」，都是它到期了。重新发送 /start，在新主菜单上重新打开即可；保存失败的那次修改不会生效，记得重新填一遍。</p>
   </section>
@@ -11149,6 +12050,7 @@ function buildPanelPage() {
     <select id="f_verifymode">
       <option value="turnstile">Turnstile 小程序验证</option>
       <option value="quiz">静态问答验证</option>
+      <option value="sequence">顺序点击验证</option>
     </select>
     <div class="hint" id="vmode_hint"></div>
     <button class="save" data-k="verify_mode" data-t="f_verifymode">保存</button>
@@ -11750,7 +12652,11 @@ function validateScalarConfig(key, rawValue) {
   }
 
   if (key === 'verify_mode') {
-    if (raw !== 'turnstile' && raw !== 'quiz') {
+    if (
+      raw !== 'turnstile' &&
+      raw !== 'quiz' &&
+      raw !== 'sequence'
+    ) {
       return { error: '验证方式无效' };
     }
 
@@ -12036,6 +12942,23 @@ async function handleConfigApi(request, env) {
     return def !== undefined ? def : (DEFAULTS[key] ?? '');
   };
 
+  // 文案类展示：图内值为空串时与运行时 textConfig 同
+  // 口径回退默认值——带外写入的空串运行时并不生效，
+  // 面板若照原样显示成空白会与实际发出的文案对不上。
+  const cfgText = (key) => {
+    const value = cfgAll[key];
+
+    if (
+      value === undefined ||
+      value === null ||
+      value === ''
+    ) {
+      return DEFAULTS[key] ?? '';
+    }
+
+    return value;
+  };
+
   // 展示值与运行时同一口径（trunc + 范围钳制；两个 TTL
   // 还要求整数，非整数运行时按关闭处理，展示同步为 0），
   // 免得带外坏值在面板上显示成运行时根本不会用的数。
@@ -12095,7 +13018,7 @@ async function handleConfigApi(request, env) {
     turnstileReady: isTurnstileConfigured(env),
     pause_reply_enabled:
       (cfg('pause_reply_enabled', 'true')) === 'true',
-    pause_reply_text: cfg('pause_reply_text', '请稍后再试'),
+    pause_reply_text: cfgText('pause_reply_text'),
     pause_state:
       await describePauseStateForPanel(env),
     verified_ttl_days: ttlShow('verified_ttl_days'),
@@ -12142,15 +13065,15 @@ async function handleConfigApi(request, env) {
     block_notice_enabled:
       (cfg('block_notice_enabled', 'true')) === 'true',
     verify_success_text:
-      cfg('verify_success_text'),
+      cfgText('verify_success_text'),
     quiz_wrong_text:
-      cfg('quiz_wrong_text'),
+      cfgText('quiz_wrong_text'),
     pause_restored_text:
-      cfg('pause_restored_text'),
+      cfgText('pause_restored_text'),
     block_notice_text:
-      cfg('block_notice_text'),
+      cfgText('block_notice_text'),
     unblock_notice_text:
-      cfg('unblock_notice_text'),
+      cfgText('unblock_notice_text'),
     topic_title_style:
       cfg('topic_title_style', 'note_first'),
     menu_buttons: {
@@ -12579,6 +13502,10 @@ async function handleUserListAction(request, env) {
     );
 
     await voidUserPass(env, targetId);
+
+    // 在途顺序点击题目一并作废（与作废通行证同口径）：
+    // 重置后旧题点完不能再算数。
+    await dbConfigDelete(`seq:${targetId}`, env);
 
     return Response.json({ ok: true });
   }
@@ -13487,15 +14414,20 @@ async function getPauseState(env) {
       env
     );
 
-    // 先翻牌再清状态：中途被打断时状态还在，下一次读到
-    // 过期状态会续跑剩余记录；通知仍只由抢到的一方发。
+    // 先翻牌、翻完才清状态：单次只翻一批（上限见
+    // flipPauseCards），仍有剩余（或读取失败、剩余未知）
+    // 时保留状态行——它 until 已过期，后续每一次读状态
+    // 都会续翻一批，直到翻完才清行，残卡不会搁浅；
+    // 通知仍只由抢到的一方发。
     // 整体包 try：翻牌是写操作（逐卡外部调用 + 删记录），
     // 却挂在读路径上内联执行，异常绝不能逃出本函数拖死
     // 触发它的那条更新——失败只记日志，状态保留待续跑。
     try {
-      await flipPauseCards(env);
+      const flip = await flipPauseCards(env);
 
-      await dbConfigDelete(PAUSE_STATE_KEY, env);
+      if (flip.remaining <= 0) {
+        await dbConfigDelete(PAUSE_STATE_KEY, env);
+      }
     } catch (error) {
       console.error(
         '熔断到期翻牌或清状态失败（下次触发续跑）：',
@@ -13549,7 +14481,9 @@ async function stopPause(env) {
 // （惰性到期、闸门、菜单）内联执行，必须给单次请求
 // 留出正文处理的子请求预算；剩余记录保留，下一次
 // 触发继续翻。返回值 { remaining, settled }：本轮后
-// 剩余未翻数与本轮已处理（删记录）数。
+// 剩余未翻数与本轮已处理（删记录）数；读取记录本身
+// 失败时 remaining=-1（剩余未知），调用方不得据此
+// 认定已翻完而清熔断状态行。
 async function flipPauseCards(env, limit = 10) {
   let rows = [];
 
@@ -13568,7 +14502,9 @@ async function flipPauseCards(env, limit = 10) {
       error?.message || error
     );
 
-    return { remaining: 0, settled: 0 };
+    // remaining=-1 与「真翻完」的 0 区分开：调用方据此
+    // 决定是否清熔断状态行，未知时必须保留待续跑。
+    return { remaining: -1, settled: 0 };
   }
 
   // 恢复文案循环外读一次：逐卡读同一键是纯浪费，
@@ -13678,24 +14614,77 @@ async function performPause(env, minutes, byAdminId) {
 }
 
 async function performResume(env, byAdminId) {
-  // 先翻牌、后清状态：翻牌中途被打断时暂停状态还在，
-  // 管理员再发一次 /resume 即可续跑剩余记录。
-  // 分批翻（单批上限见 flipPauseCards）：循环到翻完或
-  // 达到批数上限，剩余记录留下一次触发续翻；某一整批
-  // 一张都没翻动（多半是持续性故障）就停下，不空转。
+  // 先翻牌、翻完才清状态：分批翻（单批上限见
+  // flipPauseCards），直到剩余为 0 才走 stopPause 清行。
+  // 没翻完不清行：某批一张都没翻动（多半是持续性
+  // 故障）、批数用尽仍有剩余、或剩余未知（读取失败）
+  // 时，把状态行的 until 改到过去并保留该行——服务
+  // 即刻按已恢复处理（读状态一律返回未熔断），后续每
+  // 一次读状态又会续翻一批，直到翻完由读路径清行，
+  // 残卡不会搁浅（见 getPauseState 的到期续翻）。
+  let flip = { remaining: 0, settled: 0 };
+
   for (let pass = 0; pass < 20; pass += 1) {
-    const flip = await flipPauseCards(env);
+    flip = await flipPauseCards(env);
 
     if (flip.remaining <= 0 || flip.settled <= 0) {
       break;
     }
   }
 
-  await stopPause(env);
+  if (flip.remaining <= 0) {
+    await stopPause(env);
+
+    await notifyPrimaryAdmins(
+      env,
+      '▶️ 机器人已恢复服务。',
+      byAdminId
+    );
+
+    return;
+  }
+
+  try {
+    const raw = await dbConfigGet(PAUSE_STATE_KEY, env);
+    const state = safeJsonParse(raw, null);
+
+    if (
+      state &&
+      typeof state === 'object' &&
+      state.episode
+    ) {
+      // 先占掉到期通知名额：后续读路径续翻时不会再
+      // 补发一条「已自动恢复」的重复通知。
+      await dbConfigClaim(
+        'sys:pause-notified',
+        String(state.episode),
+        env
+      );
+
+      state.until = Date.now() - 1;
+
+      await setConfig(
+        PAUSE_STATE_KEY,
+        JSON.stringify(state),
+        env
+      );
+    }
+  } catch (error) {
+    console.error(
+      '恢复服务保留待续翻状态失败：',
+      error?.message || error
+    );
+  }
+
+  const leftText =
+    flip.remaining > 0
+      ? `尚有 ${flip.remaining} 张提示卡未翻完`
+      : '尚有部分提示卡未翻完';
 
   await notifyPrimaryAdmins(
     env,
-    '▶️ 机器人已恢复服务。',
+    '▶️ 机器人已恢复服务。' +
+      `${leftText}，将随后续消息自动翻完。`,
     byAdminId
   );
 }

@@ -19,7 +19,8 @@
  *   管理员、30 分钟），接口每次复核身份，后两页仅主管理员可用。
  * - D1 不存消息正文：只存转发配对（rxmap）、状态与备注；配对类记
  *   录 90 天清理；verified_ttl_days 到期删访客行与话题映射，回来
- *   的人会新建话题。
+ *   的人会新建话题；reverify_ttl_days（温和版）到期只把已验证访客
+ *   改回待验证，档案、备注与话题都保留，回来重验后还在原话题。
  * 功能清单（与仓库 README-增强版 条目对应）
  * Turnstile / 问答双验证与回退；管理员一次性通行证（网页访客列表发放，机器人私聊送达，30 分钟有效、凭 Telegram 身份确认、用后即焚，救济怎么也过不了验证的访客）；验证提示、通行证与成功回执都会记录消息 ID 并自动清理：通过验证即撤回提示与未用通行证，成功回执在首条消息转发成功后撤回，过期通行证在访客下次互动时清扫，状态类消息只保留最新一条；访客列表会显示待验证访客的通行证状态（已发证剩余分钟），发证动作返回到期时间并即时刷新行内徽标；第三轮三路审计修复：删人/重置/超时清理连带作废通行证、Turnstile 确认补封禁检查、删证与发证改原子条件操作、熔断到期通知与熔断回复改原子占用、验证提示加 3 分钟节流、反应镜像补访客状态检查、初始化错误不外泄细节、节流标记在验证成功/删人/超时清理时一并清掉；引用转发（含部分引用，三级降级）；
  * 反应双向同步；原地编辑同步 + 回复关联的 ✏️ 提示（Bot API 编辑
@@ -60,6 +61,7 @@ const DEFAULTS = {
   block_keywords: '[]',
   block_threshold: '5',
   verified_ttl_days: '0',
+  reverify_ttl_days: '0',
   pause_reply_enabled: 'true',
   pause_reply_text: '请稍后再试',
   authorized_admins: '[]',
@@ -802,6 +804,8 @@ async function cleanupDatabase(env) {
 
     await cleanupExpiredUsers(env, now);
 
+    await cleanupReverifyExpiredUsers(env, now);
+
     await cleanupStaleMenuTracks(env);
 
     await sweepEphemeralNotices(env);
@@ -858,6 +862,77 @@ async function cleanupStaleMenuTracks(env) {
         env
       );
     }
+  }
+}
+
+// 温和版超时处理：已验证访客长期不活跃时只改回待验证，
+// 档案、备注与话题映射都保留，对方回来重新验证后
+// 还在原来的话题里继续聊。不动 updated_at：不活跃时钟
+// 继续按最后一次真实活动走，删档版（verified_ttl_days）
+// 的计时不受影响，两者可叠加（先改回、后删档）。
+async function cleanupReverifyExpiredUsers(env, now) {
+  const ttlDays =
+    Number(
+      await getConfig(
+        'reverify_ttl_days',
+        env,
+        '0'
+      )
+    ) || 0;
+
+  if (
+    !Number.isInteger(ttlDays) ||
+    ttlDays <= 0
+  ) {
+    return;
+  }
+
+  const cutoff = now - ttlDays * 86400;
+
+  const result =
+    await env.TG_BOT_DB.prepare(
+      'SELECT user_id, is_trusted FROM users ' +
+      'WHERE user_state IN (?, ?) ' +
+      'AND is_blocked = 0 AND is_muted = 0 ' +
+      'AND updated_at IS NOT NULL ' +
+      'AND updated_at < ? LIMIT 200'
+    )
+      .bind(
+        USER_STATE.VERIFIED,
+        USER_STATE.VERIFIED,
+        cutoff
+      )
+      .all();
+
+  for (const row of result?.results || []) {
+    const userId = String(row.user_id);
+
+    // 管理员（含协管员）账号永不改动。
+    if (await isAdminUser(userId, env)) {
+      continue;
+    }
+
+    // 已设为信任（免验证）的访客不改，
+    // 否则改回待验证与信任免验的口径互相打架。
+    if (Number(row.is_trusted || 0) === 1) {
+      continue;
+    }
+
+    // 改状态时复检全部条件，避免「选中后访客恰好回来活跃」
+    // 的竞态把活跃访客误改（TOCTOU）；只改状态、不动 updated_at。
+    await env.TG_BOT_DB.prepare(
+      'UPDATE users SET user_state = ? ' +
+      'WHERE user_state = ? ' +
+      'AND is_blocked = 0 AND is_muted = 0 ' +
+      'AND updated_at < ? AND user_id = ?'
+    )
+      .bind(
+        USER_STATE.PENDING,
+        USER_STATE.VERIFIED,
+        cutoff,
+        userId
+      )
+      .run();
   }
 }
 
@@ -10001,7 +10076,7 @@ function buildGuidePage() {
     <h2>🛠 网页管理台</h2>
     <p>从主菜单打开，<b class=\"k\">只有主管理员能进</b>。所有设置都集中在这里，改完点对应的「保存」立即生效：</p>
     <ul>
-      <li><b class=\"k\">基础配置：</b>欢迎消息、验证方式与题目、已验证超时清理。超时清理填一个天数（比如 90），长期没动静的访客会被自动清除并释放位置；填 0 表示永不自动清。注意：被清掉的人下次再来会新建一个话题，老话题会留着当存档。</li>
+      <li><b class=\"k\">基础配置：</b>欢迎消息、验证方式与题目、已验证超时清理（两种）。删档版填一个天数（比如 90），长期没动静的访客会被自动清除并释放位置；填 0 表示永不自动清。注意：被清掉的人下次再来会新建一个话题，老话题会留着当存档。另有温和版「改回待验证」：同样在基础配置里填天数，到期只把人改回待验证，档案、备注与话题都留着，对方回来重新验证后还在原话题继续聊；两种可以同时开，一般温和版的天数设得更小。</li>
       <li><b class=\"k\">类型过滤：</b>不想转发的消息类型（贴纸、语音、视频等）在这里关掉，对方发了也不会过到对面去。</li>
       <li><b class=\"k\">屏蔽关键词：</b>访客的话里出现关键词会被拦下并记一次数，次数达到你设的阈值就自动封禁他。不会写正则表达式也没关系，直接填普通词句就行。</li>
       <li><b class=\"k\">自动回复：</b>访客的话包含某个词时，机器人自动回一句你预设的话（比如包含「价格」就自动回价目说明）。</li>
@@ -10217,6 +10292,10 @@ function buildPanelPage() {
     <input type="number" id="f_ttl" min="0" max="3650" step="1">
     <div class="hint">超过该天数无活跃的已验证/待验证访客会被自动清除（含其话题映射，旧话题保留为无主存档）。</div>
     <button class="save" data-k="verified_ttl_days" data-t="f_ttl">保存</button>
+    <label>已验证改回待验证（天，0 = 关闭）</label>
+    <input type="number" id="f_rvttl" min="0" max="3650" step="1">
+    <div class="hint">温和版：超过该天数无活跃的已验证访客只改回待验证，档案、备注与话题都保留，对方回来重新验证后还在原话题里聊。被封禁 / 静音 / 信任的访客不改。可与上面的删档清理同时开：一般把这个天数设得更小（先改回待验证）；删档天数从最后一次活动算起继续计时，满了照样删档。</div>
+    <button class="save" data-k="reverify_ttl_days" data-t="f_rvttl">保存</button>
   </section>
 
   <section id="sec-filter" hidden>
@@ -10598,6 +10677,7 @@ fetch('/api/config?' + qs.toString())
     applyVmode();
     setText('vmode_hint', d.turnstileReady ? '' : '提示：尚未配置 TURNSTILE 密钥，即使选择 Turnstile 也会自动回退为静态问答。');
     setVal('f_ttl', d.verified_ttl_days);
+    setVal('f_rvttl', d.reverify_ttl_days);
     setVal('f_threshold', d.block_threshold);
     setVal('f_admins', (d.authorizedAdmins || []).join(', '));
     setVal('f_pausereply', d.pause_reply_text || '请稍后再试');
@@ -10778,6 +10858,23 @@ function validateScalarConfig(key, rawValue) {
     }
 
     return { value: raw };
+  }
+
+  if (key === 'reverify_ttl_days') {
+    const days = Number(raw.trim());
+
+    if (
+      !Number.isInteger(days) ||
+      days < 0 ||
+      days > 3650
+    ) {
+      return {
+        error:
+          '改回待验证天数必须是 0 到 3650 之间的整数（0 表示关闭）'
+      };
+    }
+
+    return { value: String(days) };
   }
 
   if (key === 'verified_ttl_days') {
@@ -11060,6 +11157,10 @@ async function handleConfigApi(request, env) {
     verified_ttl_days:
       Number(
         cfg('verified_ttl_days', '0')
+      ) || 0,
+    reverify_ttl_days:
+      Number(
+        cfg('reverify_ttl_days', '0')
       ) || 0,
     block_threshold: await getBlockThreshold(env),
     filters: {

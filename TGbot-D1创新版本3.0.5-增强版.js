@@ -32,7 +32,7 @@
  * 台（原按钮菜单已下线，旧按钮回迁移提示）；新手引导 /guide；
  * 自动检查更新；服务熔断 /pause /resume（手动触发，闸门在去重之
  * 前；到期惰性恢复——由到期后第一条更新触发解除并通知，属刻意
- * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数；命令回执类话题通知（备注查看/保存/删除、重置验证、封禁/解封结果、资料卡重建、话题内熔断开启/恢复/状态结果、未识别命令）改为短暂显示，发出约 5 秒后自动删除；访客解除拉黑、发出 ✅ 提醒时，之前那条 🚫 拉黑提醒会被一并删掉（编号记在 blocknotice:<访客>）；话题里管理员发出的命令消息在处理后一并撤回（未识别的命令同样），只短暂留回执、不留命令原文；主菜单追踪记录带写入时间戳，超过 48 小时（记录里的消息号已过 Telegram 删除窗口）会被数据库清扫整行删掉，读到过期记录时也直接跳过注定失败的删除。第四轮审计修复：问答验证答错 5 次锁定 30 分钟防穷举；三页签名链接按用途分权（引导/列表/管理台互不通用），签名密钥可改用独立的 LINK_SECRET 与 webhook 校验值解耦（未配置时回退 WEBHOOK_SECRET）；整段对话清空仅主管理员可操作、确认防重复执行、访客记录已删时点确认不再把空档案建回来，且清空只删开始那一刻收集到的快照记录（清空期间新到的消息配对不受影响），提示行改分块批量查询与批量删除；拉黑提醒记账竞态收尾，删档与超时清理一并清记账；主菜单追踪清扫按值条件删防误删新鲜记录、原地编辑不再刷新追踪时间戳（时间戳只记消息号的出生时刻）、旧格式纯数字追踪恢复解析；话题被手动关闭时先重开原话题再投递、不再误判失效重建；转发失败（内容受保护等）会在话题里提醒、群权限丢失时改走主管理员私聊告警；已验证访客发送过频会被限流丢弃并提醒；反应同步补匿名管理员处理，付费/自定义 emoji 不再误清已镜像的普通反应；短暂通知落 ephem 记账，定时删除没赶上时由数据库清扫补删；菜单签名链接的来源地址改为随请求传递（去掉可被任意请求覆盖的全局变量）；以频道身份发帖等没有 from 的消息直接忽略、不再抛错；命令 @ 的机器人名不是本机器人时完全忽略；/note 保存失败时保留命令原文便于改了重发。定制化扩展：管理台新增「参数与开关」（转发限流强度、通行证/验证链接有效期、问答锁定次数与时长、命令回执停留秒数可调，均带范围校验；编辑提示、反应同步、转发失败提醒、拉黑提醒四个总开关）与「文案与呈现」（验证成功/答错、熔断恢复、拉黑/解封五句文案可改；话题名四种样式；主菜单五个按钮逐个显隐；访客列表默认排序与每页条数存服务端配置）两区；按访客例外：信任标记 is_trusted（列表/资料卡设置即置已验证并按验证成功收尾，闸门处对未验证的信任访客自动放行，重置验证与 /reverify 连带撤销，超时清理豁免，资料卡按钮仅主管理员）与放行标记 relay_exempt（免转发限流与类型过滤，关键词封禁照常），列表行带徽标与切换按钮，/api/users 附 uiDefaults 供列表页套用默认排序与页大小。
+ * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数；命令回执类话题通知（备注查看/保存/删除、重置验证、封禁/解封结果、资料卡重建、话题内熔断开启/恢复/状态结果、未识别命令）改为短暂显示，发出约 5 秒后自动删除；访客解除拉黑、发出 ✅ 提醒时，之前那条 🚫 拉黑提醒会被一并删掉（编号记在 blocknotice:<访客>）；话题里管理员发出的命令消息在处理后一并撤回（未识别的命令同样），只短暂留回执、不留命令原文；主菜单追踪记录带写入时间戳，超过 48 小时（记录里的消息号已过 Telegram 删除窗口）会被数据库清扫整行删掉，读到过期记录时也直接跳过注定失败的删除。第四轮审计修复：问答验证答错 5 次锁定 30 分钟防穷举；三页签名链接按用途分权（引导/列表/管理台互不通用），签名密钥可改用独立的 LINK_SECRET 与 webhook 校验值解耦（未配置时回退 WEBHOOK_SECRET）；整段对话清空仅主管理员可操作、确认防重复执行、访客记录已删时点确认不再把空档案建回来，且清空只删开始那一刻收集到的快照记录（清空期间新到的消息配对不受影响），提示行改分块批量查询与批量删除；拉黑提醒记账竞态收尾，删档与超时清理一并清记账；主菜单追踪清扫按值条件删防误删新鲜记录、原地编辑不再刷新追踪时间戳（时间戳只记消息号的出生时刻）、旧格式纯数字追踪恢复解析；话题被手动关闭时先重开原话题再投递、不再误判失效重建；转发失败（内容受保护等）会在话题里提醒、群权限丢失时改走主管理员私聊告警；已验证访客发送过频会被限流丢弃并提醒；反应同步补匿名管理员处理，付费/自定义 emoji 不再误清已镜像的普通反应；短暂通知落 ephem 记账，定时删除没赶上时由数据库清扫补删；菜单签名链接的来源地址改为随请求传递（去掉可被任意请求覆盖的全局变量）；以频道身份发帖等没有 from 的消息直接忽略、不再抛错；命令 @ 的机器人名不是本机器人时完全忽略；/note 保存失败时保留命令原文便于改了重发。定制化扩展：管理台「基础配置」含参数与开关（转发限流强度、通行证/验证链接有效期、问答锁定次数与时长、命令回执停留秒数可调，均带范围校验；编辑提示、反应同步、转发失败提醒、拉黑提醒四个总开关），另有「文案与呈现」（验证成功/答错、熔断恢复、拉黑/解封五句文案可改；话题名四种样式；主菜单五个按钮逐个显隐；访客列表默认排序与每页条数存服务端配置）；按访客例外：信任标记 is_trusted（列表/资料卡设置即置已验证并按验证成功收尾，闸门处对未验证的信任访客自动放行，重置验证与 /reverify 连带撤销，超时清理豁免，资料卡按钮仅主管理员）与放行标记 relay_exempt（免转发限流与类型过滤，关键词封禁照常），列表行带徽标与切换按钮，/api/users 附 uiDefaults 供列表页套用默认排序与页大小。
  * 三页（指南 / 管理台 / 访客列表）约定
  * - 页眉 position:fixed + 脚本实测高度补偿 body padding-top，
  *   不要改回 sticky：iOS 上 sticky 在滚动中逐帧重定位会闪烁。
@@ -10025,11 +10025,11 @@ function buildGuidePage() {
     <p>验证是用来挡垃圾机器人和广告号的：没通过验证的人，发什么都不会转进群里。</p>
     <ul>
       <li><b class=\"k\">Turnstile 小程序验证（推荐）：</b>访客点「开始验证」按钮，弹出一个小页面自动完成人机校验，几秒通过，体验最顺。</li>
-      <li><b class=\"k\">静态问答验证：</b>你出一道题，访客答对才放行；答案可以准备多个，用竖线 <code>|</code> 分隔，答中任意一个都算对。连着答错 5 次会被锁定 30 分钟（防有人对着答案穷举），锁定期间他发什么都不会有回应，过后自动解锁。次数和时长可以在管理台「参数与开关」里改。</li>
+      <li><b class=\"k\">静态问答验证：</b>你出一道题，访客答对才放行；答案可以准备多个，用竖线 <code>|</code> 分隔，答中任意一个都算对。连着答错 5 次会被锁定 30 分钟（防有人对着答案穷举），锁定期间他发什么都不会有回应，过后自动解锁。次数和时长可以在管理台「基础配置」里改。</li>
       <li><b class=\"k\">在哪里切换：</b>网页管理台 → 基础配置 → 验证方式。选了 Turnstile 后，问题和答案两项会自动隐藏；如果还没配好 Turnstile 密钥，机器人会自动用问答模式兜底，不会把人卡死。</li>
       <li><b class=\"k\">让某人重新验证：</b>打开他的话题，发送 <code>/reverify</code>，他下一次发消息前要重新过一遍验证。</li>
       <li><b class=\"k\">自己先试一遍：</b>私聊发送 <code>/testverify</code> 会拿到一个测试验证链接，点开能看到访客眼中的验证页长什么样；测试模式只是看看样子，不会真的放行或记录任何人。</li>
-      <li><b class=\"k\">🎫 一次性通行证（救济通道）：</b>个别访客怎么也过不了验证（比如网络连不上验证服务）时，在访客列表里他那一行点「🎫 通行证」，机器人会私聊发给他一张通行证（默认 30 分钟内有效，有效期可在管理台「参数与开关」里改），他点开确认即通过验证。通行证必须本人点开才有效，转发给别人没用，用过即作废；不依赖 Turnstile 配置，没配密钥也能发。</li>
+      <li><b class=\"k\">🎫 一次性通行证（救济通道）：</b>个别访客怎么也过不了验证（比如网络连不上验证服务）时，在访客列表里他那一行点「🎫 通行证」，机器人会私聊发给他一张通行证（默认 30 分钟内有效，有效期可在管理台「基础配置」里改），他点开确认即通过验证。通行证必须本人点开才有效，转发给别人没用，用过即作废；不依赖 Turnstile 配置，没配密钥也能发。</li>
       <li><b class=\"k\">🤝 信任（免验证）：</b>熟人可以免掉验证：在访客列表他那一行点「🤝 信任」，或在他话题的资料卡上点「设为信任」，他立即通过验证（会收到验证成功提示），以后也一直免验证；点「取消信任」收回。注意：对他「重置验证」或在话题里发 /reverify 会连信任一起撤销；被封禁的人要先解封才能设信任；资料卡上的信任按钮只有主管理员能操作。</li>
       <li><b class=\"k\">验证消息会自己清理：</b>验证提示、通行证和「🎉 验证成功」这类流程消息，用完后会被机器人自动删掉，不在访客对话里堆积：反复索要验证只留最新一条提示，通过验证时提示立即清掉，成功提示等他第一条正经消息送达后再删；过期没用的通行证会在他下次来发消息时清扫。</li>
     </ul>
@@ -10076,13 +10076,12 @@ function buildGuidePage() {
     <h2>🛠 网页管理台</h2>
     <p>从主菜单打开，<b class=\"k\">只有主管理员能进</b>。所有设置都集中在这里，改完点对应的「保存」立即生效：</p>
     <ul>
-      <li><b class=\"k\">基础配置：</b>欢迎消息、验证方式与题目、已验证超时清理（两种）。删档版填一个天数（比如 90），长期没动静的访客会被自动清除并释放位置；填 0 表示永不自动清。注意：被清掉的人下次再来会新建一个话题，老话题会留着当存档。另有温和版「改回待验证」：同样在基础配置里填天数，到期只把人改回待验证，档案、备注与话题都留着，对方回来重新验证后还在原话题继续聊；两种可以同时开，一般温和版的天数设得更小。</li>
+      <li><b class=\"k\">基础配置：</b>欢迎消息、验证方式与题目、已验证超时清理（两种）。删档版填一个天数（比如 90），长期没动静的访客会被自动清除并释放位置；填 0 表示永不自动清。注意：被清掉的人下次再来会新建一个话题，老话题会留着当存档。另有温和版「改回待验证」：同样在基础配置里填天数，到期只把人改回待验证，档案、备注与话题都留着，对方回来重新验证后还在原话题继续聊；两种可以同时开，一般温和版的天数设得更小。这一区还管参数与开关：转发限流的强度、通行证与验证链接的有效期、问答锁定的次数与时长、命令回执停留几秒（数字都带安全范围，填超了不保存），以及四个功能开关——编辑提示、反应同步、转发失败提醒、拉黑提醒，用不上哪个就关掉。</li>
       <li><b class=\"k\">类型过滤：</b>不想转发的消息类型（贴纸、语音、视频等）在这里关掉，对方发了也不会过到对面去。</li>
       <li><b class=\"k\">屏蔽关键词：</b>访客的话里出现关键词会被拦下并记一次数，次数达到你设的阈值就自动封禁他。不会写正则表达式也没关系，直接填普通词句就行。</li>
       <li><b class=\"k\">自动回复：</b>访客的话包含某个词时，机器人自动回一句你预设的话（比如包含「价格」就自动回价目说明）。</li>
       <li><b class=\"k\">协管员：</b>把帮你接待的人的 Telegram 数字 ID 填进来（多个用逗号隔开）。协管员能在话题里回复、用命令、贴表情，但进不了网页管理台，也看不到访客列表。</li>
       <li><b class=\"k\">服务熔断：</b>被消息轰炸时在这里一键暂停机器人（或用 /pause 命令），可设定暂停时长、到期自动恢复；还能设置暂停期间给访客的回复语句，或关掉回复保持完全静默。</li>
-      <li><b class=\"k\">参数与开关：</b>转发限流的强度、通行证与验证链接的有效期、问答锁定的次数与时长、命令回执停留几秒，都能在这里调（数字都带安全范围，填超了不保存）；还有四个功能开关——编辑提示、反应同步、转发失败提醒、拉黑提醒，用不上哪个就关掉。</li>
       <li><b class=\"k\">文案与呈现：</b>验证成功 / 答错、熔断恢复、拉黑 / 解封这几句机器人说的话，能改成你自己的口气；话题名的样式（备注在前还是名字在前、带不带 ID）、主菜单上显示哪些按钮、访客列表默认排序与每页条数，也都在这里。</li>
     </ul>
     <div class=\"tip\">管理台的网页链接 30 分钟过期；打开时、或者开着页面闲置超时后保存时，都会提示过期，重新发送 /start、在新主菜单上重新打开就行。</div>
@@ -10259,7 +10258,6 @@ function buildPanelPage() {
     <a class="chip" href="#sec-reply">自动回复</a>
     <a class="chip" href="#sec-admin">协管员</a>
     <a class="chip" href="#sec-pause">服务熔断</a>
-    <a class="chip" href="#sec-tune">参数与开关</a>
     <a class="chip" href="#sec-style">文案与呈现</a>
   </div>
 </header>
@@ -10267,7 +10265,7 @@ function buildPanelPage() {
   <div class="empty" id="loading">加载中…</div>
 
   <section id="sec-base" hidden>
-    <h2>📝 基础配置（验证）</h2>
+    <h2>📝 基础配置</h2>
     <label>欢迎消息</label>
     <textarea id="f_welcome" rows="4"></textarea>
     <button class="save" data-k="welcome_msg" data-t="f_welcome">保存</button>
@@ -10296,6 +10294,42 @@ function buildPanelPage() {
     <input type="number" id="f_rvttl" min="0" max="3650" step="1">
     <div class="hint">温和版：超过该天数无活跃的已验证访客只改回待验证，档案、备注与话题都保留，对方回来重新验证后还在原话题里聊。被封禁 / 静音 / 信任的访客不改。可与上面的删档清理同时开：一般把这个天数设得更小（先改回待验证）；删档天数从最后一次活动算起继续计时，满了照样删档。</div>
     <button class="save" data-k="reverify_ttl_days" data-t="f_rvttl">保存</button>
+    <h2>⚙️ 参数与开关</h2>
+    <div class="hint">说明：把问答「连错锁定次数」调小后，之前已答错多次的访客会按新次数提前锁定；已经在锁定期内的访客按落锁时的时长走完。验证链接与通行证的有效期调短，不影响已经发出去的（按发出时的时长到期）。</div>
+    <label>转发限流：突发条数（1～1000）</label>
+    <input type="number" id="t_burst" min="1" max="1000" step="1">
+    <button class="save" data-k="relay_burst" data-t="t_burst">保存</button>
+    <label>转发限流：每秒回填条数（1～100）</label>
+    <input type="number" id="t_refill" min="1" max="100" step="1">
+    <button class="save" data-k="relay_refill_per_sec" data-t="t_refill">保存</button>
+    <label>通行证有效期（分钟，1～1440）</label>
+    <input type="number" id="t_passmin" min="1" max="1440" step="1">
+    <button class="save" data-k="pass_ttl_min" data-t="t_passmin">保存</button>
+    <label>验证链接有效期（分钟，1～120）</label>
+    <input type="number" id="t_vlinkmin" min="1" max="120" step="1">
+    <button class="save" data-k="verify_link_min" data-t="t_vlinkmin">保存</button>
+    <label>问答验证：连续答错几次锁定（1～20）</label>
+    <input type="number" id="t_quizmax" min="1" max="20" step="1">
+    <button class="save" data-k="quiz_max_attempts" data-t="t_quizmax">保存</button>
+    <label>问答验证：锁定分钟（1～1440）</label>
+    <input type="number" id="t_quizlock" min="1" max="1440" step="1">
+    <button class="save" data-k="quiz_lock_min" data-t="t_quizlock">保存</button>
+    <label>命令回执停留秒数（1～120）</label>
+    <input type="number" id="t_stay" min="1" max="120" step="1">
+    <button class="save" data-k="notice_stay_sec" data-t="t_stay">保存</button>
+    <label>✏️ 编辑提示（编辑同步时那行小提示）</label>
+    <select id="t_hint"><option value="true">开启</option><option value="false">关闭</option></select>
+    <button class="save" data-k="hint_enabled" data-t="t_hint">保存</button>
+    <label>表情反应双向同步</label>
+    <select id="t_reaction"><option value="true">开启</option><option value="false">关闭</option></select>
+    <button class="save" data-k="reaction_sync_enabled" data-t="t_reaction">保存</button>
+    <label>转发失败提醒（话题 ⚠️ 与管理员告警）</label>
+    <select id="t_relayfail"><option value="true">开启</option><option value="false">关闭</option></select>
+    <button class="save" data-k="relay_fail_notice_enabled" data-t="t_relayfail">保存</button>
+    <label>拉黑 / 解封提醒</label>
+    <select id="t_blocknotice"><option value="true">开启</option><option value="false">关闭</option></select>
+    <button class="save" data-k="block_notice_enabled" data-t="t_blocknotice">保存</button>
+    <div class="hint">数字参数都带安全范围，超出范围会报错不保存；开关关掉后对应功能整体停用，随时可以再打开。</div>
   </section>
 
   <section id="sec-filter" hidden>
@@ -10354,44 +10388,6 @@ function buildPanelPage() {
     <button class="save" data-k="pause_reply_text" data-t="f_pausereply">保存</button>
     </div>
     <div class="hint">暂停期间访客新发的消息会被删除、不转发，恢复后不会补送，请提醒对方重发重要内容；对已送达消息的编辑与表情反应照常同步，两边记录保持一致。已被封禁的访客不会收到回复。暂停到期会自动恢复，也可随时恢复；到期时不会立刻发通知，恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的。</div>
-  </section>
-  <section id="sec-tune" hidden>
-    <h2>⚙️ 参数与开关</h2>
-    <div class="hint">说明：把问答「连错锁定次数」调小后，之前已答错多次的访客会按新次数提前锁定；已经在锁定期内的访客按落锁时的时长走完。验证链接与通行证的有效期调短，不影响已经发出去的（按发出时的时长到期）。</div>
-    <label>转发限流：突发条数（1～1000）</label>
-    <input type="number" id="t_burst" min="1" max="1000" step="1">
-    <button class="save" data-k="relay_burst" data-t="t_burst">保存</button>
-    <label>转发限流：每秒回填条数（1～100）</label>
-    <input type="number" id="t_refill" min="1" max="100" step="1">
-    <button class="save" data-k="relay_refill_per_sec" data-t="t_refill">保存</button>
-    <label>通行证有效期（分钟，1～1440）</label>
-    <input type="number" id="t_passmin" min="1" max="1440" step="1">
-    <button class="save" data-k="pass_ttl_min" data-t="t_passmin">保存</button>
-    <label>验证链接有效期（分钟，1～120）</label>
-    <input type="number" id="t_vlinkmin" min="1" max="120" step="1">
-    <button class="save" data-k="verify_link_min" data-t="t_vlinkmin">保存</button>
-    <label>问答验证：连续答错几次锁定（1～20）</label>
-    <input type="number" id="t_quizmax" min="1" max="20" step="1">
-    <button class="save" data-k="quiz_max_attempts" data-t="t_quizmax">保存</button>
-    <label>问答验证：锁定分钟（1～1440）</label>
-    <input type="number" id="t_quizlock" min="1" max="1440" step="1">
-    <button class="save" data-k="quiz_lock_min" data-t="t_quizlock">保存</button>
-    <label>命令回执停留秒数（1～120）</label>
-    <input type="number" id="t_stay" min="1" max="120" step="1">
-    <button class="save" data-k="notice_stay_sec" data-t="t_stay">保存</button>
-    <label>✏️ 编辑提示（编辑同步时那行小提示）</label>
-    <select id="t_hint"><option value="true">开启</option><option value="false">关闭</option></select>
-    <button class="save" data-k="hint_enabled" data-t="t_hint">保存</button>
-    <label>表情反应双向同步</label>
-    <select id="t_reaction"><option value="true">开启</option><option value="false">关闭</option></select>
-    <button class="save" data-k="reaction_sync_enabled" data-t="t_reaction">保存</button>
-    <label>转发失败提醒（话题 ⚠️ 与管理员告警）</label>
-    <select id="t_relayfail"><option value="true">开启</option><option value="false">关闭</option></select>
-    <button class="save" data-k="relay_fail_notice_enabled" data-t="t_relayfail">保存</button>
-    <label>拉黑 / 解封提醒</label>
-    <select id="t_blocknotice"><option value="true">开启</option><option value="false">关闭</option></select>
-    <button class="save" data-k="block_notice_enabled" data-t="t_blocknotice">保存</button>
-    <div class="hint">数字参数都带安全范围，超出范围会报错不保存；开关关掉后对应功能整体停用，随时可以再打开。</div>
   </section>
   <section id="sec-style" hidden>
     <h2>🎨 文案与呈现</h2>

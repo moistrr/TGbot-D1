@@ -463,6 +463,27 @@ function validateEnvironment(env) {
       `缺少环境变量或绑定：${missing.join(', ')}`
     );
   }
+
+  // 签名密钥强度下限：每位待验证访客都持有一条用此密钥
+  // 签发的链接（明文参数 + 对应 HMAC），等于公开了可供
+  // 离线爆破的样本对——弱口令被字典爆破后，五种签名
+  // 链接全可伪造。这里直接拒绝启动并写明原因。
+  if (String(env.WEBHOOK_SECRET).length < 16) {
+    throw new Error(
+      'WEBHOOK_SECRET 太短（至少 16 个字符）：' +
+      '请换成足够长的随机字符串，弱密钥会被离线爆破'
+    );
+  }
+
+  if (
+    env.LINK_SECRET &&
+    String(env.LINK_SECRET).length < 16
+  ) {
+    throw new Error(
+      'LINK_SECRET 太短（至少 16 个字符）：' +
+      '请换成足够长的随机字符串，弱密钥会被离线爆破'
+    );
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -523,6 +544,27 @@ async function telegramApi(
   try {
     data = await response.json();
   } catch {
+    // 边缘节点偶尔回非 JSON 的错误页（502/503/429 的
+    // HTML）：状态码属可重试类、且本方法可重试时，按
+    // 与网络失败相同的节拍重试，别让删除/编辑等幂等
+    // 方法一次不试就失败。非幂等方法的 mayRetry 为
+    // false，5xx 非 JSON 照样不重试（防重复投递）。
+    if (
+      (response.status === 429 ||
+        response.status >= 500) &&
+      attempt < 2 &&
+      mayRetry
+    ) {
+      await sleep(500 * (attempt + 1));
+
+      return telegramApi(
+        token,
+        method,
+        params,
+        attempt + 1
+      );
+    }
+
     throw new Error(
       `Telegram API 返回非 JSON 内容 ` +
       `(${method}, HTTP ${response.status})`
@@ -769,36 +811,55 @@ async function sweepEphemeralNotices(env) {
 
   const nowMs = Date.now();
 
+  // 单轮上限 50 行：残留行异常多时不在一轮里串行删到底，
+  // 剩下的留下一次清扫（本函数随数据库清扫反复触发）。
+  let handled = 0;
+
   for (const row of rows) {
-    const msgId = String(row.key).slice(6);
-
-    if (!/^\d+$/.test(msgId)) {
-      await dbConfigDelete(String(row.key), env);
-
-      continue;
+    if (handled >= 50) {
+      break;
     }
-
-    let parsed = null;
 
     try {
-      parsed = JSON.parse(row.value);
-    } catch (_) {
-      parsed = null;
-    }
+      const msgId = String(row.key).slice(6);
 
-    const dueAt = Number(parsed?.at || 0);
+      if (!/^\d+$/.test(msgId)) {
+        await dbConfigDelete(String(row.key), env);
 
-    if (dueAt && dueAt <= nowMs) {
-      await quietDeleteMessage(
-        env,
-        parsed?.c || env.ADMIN_GROUP_ID,
-        msgId
-      );
+        handled += 1;
 
-      await dbConfigDeleteIfValue(
-        String(row.key),
-        String(row.value),
-        env
+        continue;
+      }
+
+      let parsed = null;
+
+      try {
+        parsed = JSON.parse(row.value);
+      } catch (_) {
+        parsed = null;
+      }
+
+      const dueAt = Number(parsed?.at || 0);
+
+      if (dueAt && dueAt <= nowMs) {
+        await quietDeleteMessage(
+          env,
+          parsed?.c || env.ADMIN_GROUP_ID,
+          msgId
+        );
+
+        await dbConfigDeleteIfValue(
+          String(row.key),
+          String(row.value),
+          env
+        );
+
+        handled += 1;
+      }
+    } catch (error) {
+      console.error(
+        '补删一条短暂通知失败：',
+        error?.message || error
       );
     }
   }
@@ -1027,6 +1088,10 @@ async function cleanupExpiredUsers(env, now) {
       continue;
     }
 
+    // 删行前留好完整记录：拉黑提醒的 🚫 本体在话题里，
+    // 删完行就查不到话题 ID 了（与删人路径同口径）。
+    const fullUser = await dbUserGet(userId, env);
+
     // 删除时复检全部条件，避免「选中后访客恰好回来活跃」
     // 的竞态把活跃访客误删（TOCTOU）。
     const deleted =
@@ -1077,10 +1142,10 @@ async function cleanupExpiredUsers(env, now) {
       env
     );
 
-    await dbConfigDelete(
-      `pass:${userId}`,
-      env
-    );
+    // 连带作废通行证：删记录并删访客私聊里的证消息
+    // （与删人路径 purgeManagedUser 同口径，此前只删记录、
+    // 证消息本体残留在访客私聊里）。
+    await voidUserPass(env, userId);
 
     await dbConfigDelete(
       `pausenote:${userId}`,
@@ -1096,6 +1161,22 @@ async function cleanupExpiredUsers(env, now) {
       `promptat:${userId}`,
       env
     );
+
+    // 拉黑提醒：话题还在时先删话题里的 🚫 本体，
+    // 再删记账行（与删人路径同口径）。
+    const staleBlockNotice =
+      await dbConfigGet(
+        `blocknotice:${userId}`,
+        env
+      );
+
+    if (staleBlockNotice && fullUser?.topic_id) {
+      await quietDeleteMessage(
+        env,
+        env.ADMIN_GROUP_ID,
+        staleBlockNotice
+      );
+    }
 
     await dbConfigDelete(
       `blocknotice:${userId}`,
@@ -1511,13 +1592,7 @@ function isPrimaryAdmin(userId, env) {
   );
 }
 
-async function getAuthorizedAdmins(env) {
-  const raw = await getConfig(
-    'authorized_admins',
-    env,
-    '[]'
-  );
-
+function parseAuthorizedAdmins(raw) {
   const list = safeJsonParse(raw, []);
 
   if (!Array.isArray(list)) {
@@ -1527,6 +1602,12 @@ async function getAuthorizedAdmins(env) {
   return list
     .map((value) => String(value).trim())
     .filter((value) => /^\d+$/.test(value));
+}
+
+async function getAuthorizedAdmins(env) {
+  return parseAuthorizedAdmins(
+    await getConfig('authorized_admins', env, '[]')
+  );
 }
 
 async function isAdminUser(userId, env) {
@@ -1673,13 +1754,7 @@ function validateRegexPattern(pattern) {
   buildRegexRule(pattern);
 }
 
-async function getAutoReplyRules(env) {
-  const raw = await getConfig(
-    'keyword_responses',
-    env,
-    '[]'
-  );
-
+function parseAutoReplyRules(raw) {
   const rules = safeJsonParse(raw, []);
 
   return Array.isArray(rules)
@@ -1692,13 +1767,13 @@ async function getAutoReplyRules(env) {
     : [];
 }
 
-async function getBlockKeywords(env) {
-  const raw = await getConfig(
-    'block_keywords',
-    env,
-    '[]'
+async function getAutoReplyRules(env) {
+  return parseAutoReplyRules(
+    await getConfig('keyword_responses', env, '[]')
   );
+}
 
+function parseBlockKeywords(raw) {
   const keywords = safeJsonParse(raw, []);
 
   return Array.isArray(keywords)
@@ -1706,13 +1781,13 @@ async function getBlockKeywords(env) {
     : [];
 }
 
-async function getBlockThreshold(env) {
-  const raw = await getConfig(
-    'block_threshold',
-    env,
-    '5'
+async function getBlockKeywords(env) {
+  return parseBlockKeywords(
+    await getConfig('block_keywords', env, '[]')
   );
+}
 
+function parseBlockThreshold(raw) {
   const threshold = Number(raw);
 
   if (
@@ -1724,6 +1799,12 @@ async function getBlockThreshold(env) {
   }
 
   return threshold;
+}
+
+async function getBlockThreshold(env) {
+  return parseBlockThreshold(
+    await getConfig('block_threshold', env, '5')
+  );
 }
 
 async function findBlockKeyword(text, env) {
@@ -1819,6 +1900,10 @@ async function getFilterConfig(env) {
     );
   }
 
+  return buildFilterConfig(stored);
+}
+
+function buildFilterConfig(stored) {
   const pick = (key) =>
     stored[key] !== undefined
       ? stored[key]
@@ -2449,6 +2534,14 @@ async function ensureUserInfoCard(
   }
 
   const task = (async () => {
+    // 每轮重试先重读记录（见循环开头）：上一轮若已写回
+    // info_card_message_id（写回成功、错出在更后面），
+    // 直接视为成功、不再重发新卡。残余窗口：sendMessage
+    // 在 Telegram 侧已执行、但响应在网络层丢失时，本端
+    // 没拿到消息号、记录无从写回，重读也查不到——无从
+    // 查询「刚才那次发送到底落没落」，属平台级不可全防，
+    // 接受为已知残余风险（最多多出一张无记录的孤儿卡，
+    // 其按钮仍可正常使用）。
     let lastError = null;
 
     for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -4986,10 +5079,15 @@ async function telegramInitDataUserId(initDataRaw, botToken) {
     const authDate = Number(params.get('auth_date') || 0);
     const nowSec = Math.floor(Date.now() / 1000);
 
+    // 新鲜窗 24 小时：auth_date 在 Mini App 打开瞬间
+    // 定格，而验证链接最长 120 分钟、通行证最长 1440
+    // 分钟——1 小时窗会把「开着页面慢慢来」的合法访客
+    // 误拒。安全性由链接自身的签名 exp、通行证记录的
+    // nonce/exp 共同把关，这里只防陈旧 initData 重放。
     if (
       !authDate ||
       authDate > nowSec + 300 ||
-      nowSec - authDate > 3600
+      nowSec - authDate > 86400
     ) {
       return null;
     }
@@ -5237,7 +5335,7 @@ function renderVerifyPage(env, params) {
           Telegram.WebApp.ready();
         }
       } else if (data.error === 'bad_initdata') {
-        setStatus('❌ 请从 Telegram 里打开这条验证链接，不要用浏览器直接打开，也不要使用别人转发的链接。');
+        setStatus('❌ 验证信息已失效或无法确认身份：请关闭本页，回到与机器人的对话里重新点按钮打开；不要用浏览器直接打开，也不要使用别人转发的链接。');
       } else {
         setStatus('❌ 验证未通过，请刷新页面重试。');
 
@@ -5317,7 +5415,7 @@ function buildPassPage(params) {
         btn.disabled = false;
         var msgs = {
           bad_signature: '通行证无效或已过期，请联系管理员重新发放。',
-          bad_initdata: '无法确认你的 Telegram 身份，请从与机器人的对话里打开通行证。',
+          bad_initdata: '验证信息已失效或无法确认身份，请关闭本页，回到与机器人的对话里重新点开通行证。',
           used_or_invalid: '这张通行证已使用或已失效，请联系管理员重新发放。',
           blocked: '账号已被封禁，通行证无法使用，请联系管理员。'
         };
@@ -5368,6 +5466,46 @@ async function handlePassPage(request, env) {
   });
 }
 
+// confirm 接口节流：签名与打开者身份都验过之后、调用
+// 外部校验（siteverify）或读业务数据之前计数。挡的是
+// 持本人链接者脚本化高频 POST——每次入站都会放大成
+// 一次出站校验加若干 D1 读，还可能招致验证服务对密钥
+// 的限流、连累正常访客。同一访客 10 分钟窗口内最多
+// 20 次，正常重试远远够不到；确认成功后删键清零。
+const CONFIRM_TRY_WINDOW_MS = 10 * 60 * 1000;
+const CONFIRM_TRY_MAX = 20;
+
+async function confirmTryAllowed(env, keyPrefix, userId) {
+  const key = `${keyPrefix}:${userId}`;
+  const now = Date.now();
+
+  let rec = null;
+
+  try {
+    rec = safeJsonParse(
+      await dbConfigGet(key, env),
+      null
+    );
+  } catch {
+    rec = null;
+  }
+
+  if (
+    !rec ||
+    typeof rec !== 'object' ||
+    !Number(rec.w) ||
+    now - Number(rec.w) >= CONFIRM_TRY_WINDOW_MS
+  ) {
+    rec = { n: 0, w: now };
+  }
+
+  rec.n = Number(rec.n || 0) + 1;
+
+  await dbConfigPut(key, JSON.stringify(rec), env);
+
+  return rec.n <= CONFIRM_TRY_MAX;
+}
+
 async function handlePassConfirm(request, env) {
   const jsonResponse = (status, data) =>
     new Response(JSON.stringify(data), {
@@ -5404,6 +5542,15 @@ async function handlePassConfirm(request, env) {
 
   if (openerId !== u) {
     return jsonResponse(403, { ok: false, error: 'bad_initdata' });
+  }
+
+  if (
+    !(await confirmTryAllowed(env, 'passconfirmtry', u))
+  ) {
+    return jsonResponse(429, {
+      ok: false,
+      error: 'too_many_attempts'
+    });
   }
 
   const rec = await passRecordGet(u, env);
@@ -5460,6 +5607,8 @@ async function handlePassConfirm(request, env) {
       );
     }
   }
+
+  await dbConfigDelete(`passconfirmtry:${u}`, env);
 
   return jsonResponse(200, { ok: true });
 }
@@ -5619,6 +5768,15 @@ async function handleVerifyConfirm(
     });
   }
 
+  if (
+    !(await confirmTryAllowed(env, 'confirmtry', u))
+  ) {
+    return jsonResponse(429, {
+      ok: false,
+      error: 'too_many_attempts'
+    });
+  }
+
   let verifyResult;
 
   try {
@@ -5702,6 +5860,8 @@ async function handleVerifyConfirm(
       });
     }
 
+    await dbConfigDelete(`confirmtry:${u}`, env);
+
     return jsonResponse(200, {
       ok: true,
       test: true
@@ -5756,6 +5916,8 @@ async function handleVerifyConfirm(
       );
     }
   }
+
+  await dbConfigDelete(`confirmtry:${u}`, env);
 
   return jsonResponse(200, {
     ok: true
@@ -6054,6 +6216,13 @@ async function handlePrivateMessage(
         userId,
         env
       );
+
+    // 被封禁的访客发 /start 一律静默：不发「您已通过验证」
+    // （与其实际状态相反、纯误导），也不走 handleStart
+    // 发欢迎语与验证提示。主管理员在上方已回菜单，不受影响。
+    if (user.is_blocked) {
+      return;
+    }
 
     if (isAdmin) {
       if (
@@ -6436,6 +6605,40 @@ async function handlePrivateMessage(
           '请使用 /start 命令开始验证。'
       }
     );
+
+    return;
+  }
+
+  if (isAdmin) {
+    // 管理员（含主管理员与协管员）在私聊里发普通消息：
+    // 私聊侧是访客通道，不把管理员的话转发进话题、
+    // 更不为其自建话题；回复访客请去管理群的话题里。
+    // 提示按 3 分钟节流（与验证提示同口径），避免连发刷屏。
+    const lastHint = Number(
+      (await dbConfigGet(
+        `adminhint:${userId}`,
+        env
+      )) || 0
+    );
+
+    if (Date.now() - lastHint >= PROMPT_RESEND_MIN_MS) {
+      await dbConfigPut(
+        `adminhint:${userId}`,
+        String(Date.now()),
+        env
+      );
+
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text:
+            '您是管理员，私聊里请使用命令或菜单；' +
+            '要回复访客，请到管理群的话题里发送。'
+        }
+      );
+    }
 
     return;
   }
@@ -7443,6 +7646,36 @@ if (parsed.command === 'card') {
       return true;
     }
 
+    // 删除对象以「目标访客记录里的话题」为准，不用当前
+    // 消息所在的话题：在 A 的话题里执行 /terminate B 时，
+    // 用当前话题会删掉 A 的话题、解绑 B，两边都错位。
+    const targetUser =
+      await dbUserGet(userId, env);
+    const targetTopicId = targetUser?.topic_id
+      ? String(targetUser.topic_id)
+      : '';
+
+    if (!targetTopicId) {
+      await dbUserUpdate(
+        userId,
+        {
+          topic_id: null,
+          info_card_message_id: null,
+          topic_creating: false,
+          topic_lock_at: null
+        },
+        env
+      );
+
+      await sendTopicNotice(
+        message,
+        'ℹ️ 该访客没有话题可删除，已清除其话题绑定。',
+        env
+      );
+
+      return true;
+    }
+
     try {
       await telegramApi(
         env.BOT_TOKEN,
@@ -7450,7 +7683,7 @@ if (parsed.command === 'card') {
         {
           chat_id: env.ADMIN_GROUP_ID,
           message_thread_id:
-            Number(topicId)
+            Number(targetTopicId)
         }
       );
 
@@ -7926,6 +8159,12 @@ async function handleAdminEditedReply(
   }
 
   if (editedMessage.from?.is_bot) {
+    return;
+  }
+
+  // 以频道/匿名身份编辑的消息可能没有 from：无从核验
+  // 发送者身份，直接忽略（避免下面解引用抛错）。
+  if (!editedMessage.from) {
     return;
   }
 
@@ -8408,10 +8647,12 @@ async function handleUserCardCallback(
     ) {
       await dbUserUpdate(
         targetUserId,
-        {
-          is_blocked:
-            action === 'block'
-        },
+        action === 'block'
+          ? { is_blocked: true }
+          // 解封与 /unban 同口径：连带清零关键词命中
+          // 计数，否则旧计数仍达阈值、再命中一次就
+          // 立刻被再次自动封禁。
+          : { is_blocked: false, block_count: 0 },
         env
       );
     }
@@ -8870,6 +9111,27 @@ async function collectConversationMessageIds(
   const topicIds = new Set();
   const pairKeys = [];
 
+  // 「组」：一对配对（私聊侧 + 话题侧）连同挂在它上面的
+  // 提示行。清空按组推进——一组双边都删过，才删这一组
+  // 的记录行；中途停下时没轮到的组整组保留，下次接着删。
+  const units = [];
+  const unitByPriv = new Map();
+  const unitByTopic = new Map();
+
+  const newUnit = () => {
+    const unit = {
+      priv: null,
+      topic: null,
+      privExtra: [],
+      topicExtra: [],
+      keys: []
+    };
+
+    units.push(unit);
+
+    return unit;
+  };
+
   for (const row of pairRows.results || []) {
     const mid = String(row.message_id || '');
     const text = String(row.text || '');
@@ -8879,6 +9141,26 @@ async function collectConversationMessageIds(
     pairKeys.push(mid);
 
     if (text === 'gone') {
+      // 墓碑行没有可删的消息，只带走键：挂到已有的组上，
+      // 没有组就自成一组（键-only）。
+      let unit = null;
+
+      if (mid.startsWith(`p:${userId}:`)) {
+        unit = unitByPriv.get(
+          Number(mid.slice(`p:${userId}:`.length))
+        ) || null;
+      } else if (mid.startsWith('t:')) {
+        unit = unitByTopic.get(
+          Number(mid.slice(2))
+        ) || null;
+      }
+
+      if (!unit) {
+        unit = newUnit();
+      }
+
+      unit.keys.push(mid);
+
       continue;
     }
 
@@ -8890,12 +9172,56 @@ async function collectConversationMessageIds(
 
       if (priv) privateIds.add(priv);
       if (topic) topicIds.add(topic);
+
+      let unit = priv
+        ? unitByPriv.get(priv) || null
+        : null;
+
+      if (!unit) {
+        unit = newUnit();
+
+        if (priv) {
+          unit.priv = priv;
+          unitByPriv.set(priv, unit);
+        }
+      }
+
+      unit.keys.push(mid);
+
+      if (topic) {
+        unit.topic = topic;
+        unitByTopic.set(topic, unit);
+      }
     } else if (mid.startsWith('t:')) {
       const topic = Number(mid.slice(2));
       const priv = Number(text.split(':')[1]);
 
       if (topic) topicIds.add(topic);
       if (priv) privateIds.add(priv);
+
+      let unit = topic
+        ? unitByTopic.get(topic) || null
+        : null;
+
+      if (!unit && priv) {
+        unit = unitByPriv.get(priv) || null;
+      }
+
+      if (!unit) {
+        unit = newUnit();
+
+        if (topic) {
+          unit.topic = topic;
+          unitByTopic.set(topic, unit);
+        }
+
+        if (priv) {
+          unit.priv = priv;
+          unitByPriv.set(priv, unit);
+        }
+      }
+
+      unit.keys.push(mid);
     }
   }
 
@@ -8910,11 +9236,42 @@ async function collectConversationMessageIds(
   const hintKeys = [];
 
   for (const row of hintRows.results || []) {
-    hintKeys.push(String(row.message_id || ''));
+    const hkey = String(row.message_id || '');
+
+    hintKeys.push(hkey);
 
     const hid = Number(row.text);
 
     if (hid) topicIds.add(hid);
+
+    // hint:p:<uid>:<私聊消息号>，text 为话题侧提示消息号：
+    // 挂到该私聊消息所属的组上（话题侧提示随组一起删）。
+    const priv = Number(
+      hkey.slice(`hint:p:${userId}:`.length)
+    );
+
+    let unit = priv
+      ? unitByPriv.get(priv) || null
+      : null;
+
+    if (!unit) {
+      unit = newUnit();
+
+      if (priv) {
+        unit.priv = priv;
+        unitByPriv.set(priv, unit);
+      }
+    }
+
+    unit.keys.push(hkey);
+
+    if (hid) {
+      unit.topicExtra.push(hid);
+
+      if (!unitByTopic.has(hid)) {
+        unitByTopic.set(hid, unit);
+      }
+    }
   }
 
   // hint:t: 改按 100 条分块 IN 查询：逐条点读在长对话
@@ -8928,6 +9285,14 @@ async function collectConversationMessageIds(
     );
 
     hintKeys.push(...keys);
+
+    for (const [idx, topicId] of chunk.entries()) {
+      const unit = unitByTopic.get(topicId);
+
+      if (unit) {
+        unit.keys.push(keys[idx]);
+      }
+    }
 
     const placeholders = keys
       .map(() => '?')
@@ -8943,7 +9308,23 @@ async function collectConversationMessageIds(
     for (const row of hintTRows.results || []) {
       const hid = Number(row.text);
 
-      if (hid) privateIds.add(hid);
+      if (hid) {
+        privateIds.add(hid);
+
+        // hint:t:<话题消息号> 的 text 为私聊侧提示消息号，
+        // 挂回该话题消息所属的组。
+        const topicId = Number(
+          String(row.message_id || '').slice(
+            'hint:t:'.length
+          )
+        );
+
+        const unit = unitByTopic.get(topicId);
+
+        if (unit) {
+          unit.privExtra.push(hid);
+        }
+      }
     }
   }
 
@@ -8951,22 +9332,40 @@ async function collectConversationMessageIds(
     privateIds: [...privateIds],
     topicIds: [...topicIds],
     pairKeys,
-    hintKeys
+    hintKeys,
+    units
   };
 }
 
-// 批量删除并计数：整批失败时退回逐条删，
+// 批量删除并计数：整批失败时二分拆分（对半拆到单条才
+// 定性），不再一失败就整批 100 条逐条删——批里只有一两
+// 条删不掉时，逐条退化要烧上百次调用；二分只需对数级。
 // 「消息不存在」按既有口径视为已删。
+// 可选 budget（{ calls, limit }）：每次 telegramApi 调用
+// 计一次（其内部重试不另计），预算耗尽即停，返回
+// complete=false，供上层停在块边界分次推进。
 async function deleteMessagesCounted(
   env,
   chatId,
-  ids
+  ids,
+  budget = null
 ) {
   let ok = 0;
   let failed = 0;
+  let covered = 0;
 
-  for (let i = 0; i < ids.length; i += 100) {
-    const chunk = ids.slice(i, i + 100);
+  const del = async (chunk) => {
+    if (!chunk.length) {
+      return;
+    }
+
+    if (budget && budget.calls >= budget.limit) {
+      return;
+    }
+
+    if (budget) {
+      budget.calls += 1;
+    }
 
     try {
       await telegramApi(
@@ -8979,86 +9378,158 @@ async function deleteMessagesCounted(
       );
 
       ok += chunk.length;
-    } catch {
-      for (const id of chunk) {
-        try {
-          await telegramApi(
-            env.BOT_TOKEN,
-            'deleteMessage',
-            {
-              chat_id: chatId,
-              message_id: id
-            }
-          );
+      covered += chunk.length;
+    } catch (error) {
+      if (chunk.length === 1) {
+        covered += 1;
 
+        if (
+          /not found/i.test(
+            String(error?.message || error)
+          )
+        ) {
           ok += 1;
-        } catch (error) {
-          if (
-            /not found/i.test(
-              String(error?.message || error)
-            )
-          ) {
-            ok += 1;
-          } else {
-            failed += 1;
-          }
+        } else {
+          failed += 1;
         }
+
+        return;
       }
+
+      const mid = Math.ceil(chunk.length / 2);
+
+      await del(chunk.slice(0, mid));
+      await del(chunk.slice(mid));
     }
+  };
+
+  for (let i = 0; i < ids.length; i += 100) {
+    await del(ids.slice(i, i + 100));
   }
 
-  return { ok, failed };
+  return {
+    ok,
+    failed,
+    complete: covered >= ids.length
+  };
 }
 
 // 清空执行体：删私聊副本（必做）+ 话题内副本（可选），
-// 然后删掉该访客的全部配对与提示记账行。
+// 并删掉该访客的配对与提示记账行。
+// 按「组」推进（每 50 组一块）：本组双边都删过，才删
+// 本组的记录行（仍只删收集快照里的行——清空期间新到
+// 的消息配对不在快照内，不受影响）。全部删除调用计入
+// 同一份预算（约 40 次）：大体量会话一轮删不完时停在
+// 组边界，剩余组的记录原样保留，返回 partial/remaining，
+// 管理员再执行一次 /clear 就能接着删（确认占用按确认
+// 消息编号，新确认照常能占上，不会卡死）。
 async function wipeConversationCopies(
   userId,
   env,
   includeTopicContents
 ) {
-  const { privateIds, topicIds, pairKeys, hintKeys } =
+  const { units } =
     await collectConversationMessageIds(
       userId,
       env
     );
 
-  const priv = await deleteMessagesCounted(
-    env,
-    userId,
-    privateIds
-  );
+  const budget = { calls: 0, limit: 40 };
 
+  let priv = { ok: 0, failed: 0 };
   let topic = { ok: 0, failed: 0 };
+  let remaining = 0;
 
-  if (includeTopicContents) {
-    topic = await deleteMessagesCounted(
-      env,
-      env.ADMIN_GROUP_ID,
-      topicIds
-    );
-  }
+  for (let i = 0; i < units.length; i += 50) {
+    const group = units.slice(i, i + 50);
 
-  // 收尾只删收集快照里的配对/提示行（按 100 条分块
-  // batch）：此前按前缀无条件删，清空期间新到的消息
-  // 配对会被误扫、副本成孤儿；快照之外的行一律不碰。
-  const recordKeys = [...pairKeys, ...hintKeys];
+    if (budget.calls >= budget.limit) {
+      remaining = units.length - i;
 
-  for (let i = 0; i < recordKeys.length; i += 100) {
-    const chunk = recordKeys.slice(i, i + 100);
+      break;
+    }
 
-    await env.TG_BOT_DB.batch(
-      chunk.map((key) =>
-        messageDataDeleteStatement(
-          REACTION_MAP_USER,
-          key,
-          env
-        )
+    const privIds = [
+      ...new Set(
+        group
+          .flatMap((unit) => [
+            unit.priv,
+            ...unit.privExtra
+          ])
+          .filter(Boolean)
       )
+    ];
+
+    const topicIds = includeTopicContents
+      ? [
+          ...new Set(
+            group
+              .flatMap((unit) => [
+                unit.topic,
+                ...unit.topicExtra
+              ])
+              .filter(Boolean)
+          )
+        ]
+      : [];
+
+    const privPart = await deleteMessagesCounted(
+      env,
+      userId,
+      privIds,
+      budget
     );
+
+    const topicPart = includeTopicContents
+      ? await deleteMessagesCounted(
+          env,
+          env.ADMIN_GROUP_ID,
+          topicIds,
+          budget
+        )
+      : { ok: 0, failed: 0, complete: true };
+
+    priv = {
+      ok: priv.ok + privPart.ok,
+      failed: priv.failed + privPart.failed
+    };
+
+    topic = {
+      ok: topic.ok + topicPart.ok,
+      failed: topic.failed + topicPart.failed
+    };
+
+    if (!privPart.complete || !topicPart.complete) {
+      remaining = units.length - i;
+
+      break;
+    }
+
+    const recordKeys = group.flatMap(
+      (unit) => unit.keys
+    );
+
+    for (let j = 0; j < recordKeys.length; j += 100) {
+      const chunk = recordKeys.slice(j, j + 100);
+
+      await env.TG_BOT_DB.batch(
+        chunk.map((key) =>
+          messageDataDeleteStatement(
+            REACTION_MAP_USER,
+            key,
+            env
+          )
+        )
+      );
+    }
   }
 
-  return { private: priv, topic };
+  return {
+    private: priv,
+    topic,
+    partial: remaining > 0,
+    remaining
+  };
 }
 
 // /clear 的确认按钮回调：clear:yes:<访客ID> / clear:no:<访客ID>。
@@ -9207,6 +9678,27 @@ async function handleClearCallback(
     env,
     true
   );
+
+  if (wipe.partial) {
+    const partLines = [
+      `🧹 与访客 ${userId} 的聊天记录已删一部分：`,
+      `· 话题内删除 ${wipe.topic.ok} 条` +
+        (wipe.topic.failed
+          ? `，${wipe.topic.failed} 条删除失败`
+          : ''),
+      `· 私聊删除 ${wipe.private.ok} 条` +
+        (wipe.private.failed
+          ? `，${wipe.private.failed} 条删不掉（多为超过 48 小时）`
+          : ''),
+      `本次调用预算已用完，还有约 ${wipe.remaining} 组消息未处理；` +
+        '再次执行 /clear 可继续。',
+      '话题与访客档案已保留。'
+    ];
+
+    await editConfirm(partLines.join('\n'));
+
+    return;
+  }
 
   const lines = [
     `🧹 已清空与访客 ${userId} 的聊天记录：`,
@@ -9690,6 +10182,23 @@ async function handlePauseCallback(
   }
 
   if (data === 'pause:resume') {
+    // 与命令路径对齐：没有进行中的熔断时短路，不执行
+    // 恢复全流程，更不群发并未发生的「已恢复」通知
+    // （熔断多半已惰性到期、状态早被清掉）。
+    const state = await getPauseState(env);
+
+    if (!state) {
+      await answerCallback(
+        callbackId,
+        env,
+        '当前没有处于暂停状态。'
+      );
+
+      await showMainMenu(senderId, env, messageId, 0, origin);
+
+      return;
+    }
+
     await performResume(env, senderId);
 
     await answerCallback(
@@ -10023,10 +10532,17 @@ async function handleUserListApi(request, env) {
 
   const rows = result?.results || [];
 
+  // 协管员与主管理员一样是管理侧账号，不是访客：
+  // 不出现在访客列表里（计数口径见 countUsersWhere）。
+  const coAdminIds =
+    await getAuthorizedAdmins(env);
+
   const users = await Promise.all(
     rows
     .filter(
-      (user) => !isPrimaryAdmin(user.user_id, env)
+      (user) =>
+        !isPrimaryAdmin(user.user_id, env) &&
+        !coAdminIds.includes(String(user.user_id))
     )
     .map(async (user) => {
       const info = parseUserInfoForList(user);
@@ -10106,7 +10622,14 @@ async function countRows(env, sql, binds) {
 }
 
 async function countUsersWhere(env, extraSql, binds) {
-  const adminIds = getPrimaryAdminIds(env);
+  // 排除集合 = 主管理员 + 协管员：协管员不是访客，
+  // 不进列表总数（total/truncated）与各项统计口径。
+  const adminIds = [
+    ...new Set([
+      ...getPrimaryAdminIds(env),
+      ...(await getAuthorizedAdmins(env))
+    ])
+  ];
 
   let sql = 'SELECT COUNT(*) AS n FROM users';
   const allBinds = [];
@@ -11486,7 +12009,7 @@ async function readPanelPostBody(
     };
   }
 
-  return { body };
+  return { body, adminId };
 }
 
 async function handleConfigApi(request, env) {
@@ -11539,8 +12062,29 @@ async function handleConfigApi(request, env) {
     return Math.min(3650, Math.max(0, n));
   };
 
-  const filters = await getFilterConfig(env);
-  const rules = await getAutoReplyRules(env);
+  // 以下五项的键都无冒号、已在全表图内：直接本地解析，
+  // 不再逐个查库（解析与各 getter 共用同一份逻辑）。
+  const filterStored = {};
+
+  for (const key of [
+    'enable_image_forwarding',
+    'enable_link_forwarding',
+    'enable_text_forwarding',
+    'enable_audio_forwarding',
+    'enable_sticker_forwarding',
+    'enable_user_forwarding',
+    'enable_group_forwarding',
+    'enable_channel_forwarding'
+  ]) {
+    if (cfgAll[key] !== undefined) {
+      filterStored[key] = cfgAll[key];
+    }
+  }
+
+  const filters = buildFilterConfig(filterStored);
+  const rules = parseAutoReplyRules(
+    cfg('keyword_responses', '[]')
+  );
 
   return Response.json({
     ok: true,
@@ -11556,7 +12100,8 @@ async function handleConfigApi(request, env) {
       await describePauseStateForPanel(env),
     verified_ttl_days: ttlShow('verified_ttl_days'),
     reverify_ttl_days: ttlShow('reverify_ttl_days'),
-    block_threshold: await getBlockThreshold(env),
+    block_threshold:
+      parseBlockThreshold(cfg('block_threshold', '5')),
     filters: {
       enable_image_forwarding: filters.media,
       enable_link_forwarding: filters.link,
@@ -11568,14 +12113,16 @@ async function handleConfigApi(request, env) {
       enable_channel_forwarding:
         filters.channel_forward
     },
-    keywords: await getBlockKeywords(env),
+    keywords:
+      parseBlockKeywords(cfg('block_keywords', '[]')),
     autoReplies: rules.map((rule) => ({
       id: String(rule.id || ''),
       keywords: String(rule.keywords || ''),
       response: String(rule.response || '')
     })),
-    authorizedAdmins:
-      await getAuthorizedAdmins(env),
+    authorizedAdmins: parseAuthorizedAdmins(
+      cfg('authorized_admins', '[]')
+    ),
     relay_burst: clampShow('relay_burst', 30, 1, 1000),
     relay_refill_per_sec:
       clampShow('relay_refill_per_sec', 5, 1, 100),
@@ -11704,7 +12251,7 @@ async function handleConfigPause(request, env) {
     return parsed.response;
   }
 
-  const { body } = parsed;
+  const { body, adminId } = parsed;
   const action = String(body?.action || '');
 
   if (action === 'pause') {
@@ -11724,7 +12271,7 @@ async function handleConfigPause(request, env) {
       );
     }
 
-    const state = await performPause(env, minutes, '');
+    const state = await performPause(env, minutes, adminId);
 
     return Response.json({
       ok: true,
@@ -11737,7 +12284,19 @@ async function handleConfigPause(request, env) {
   }
 
   if (action === 'resume') {
-    await performResume(env, '');
+    // 与命令路径对齐：没有进行中的熔断时短路，不执行
+    // 恢复全流程，更不群发并未发生的「已恢复」通知。
+    const state = await getPauseState(env);
+
+    if (!state) {
+      return Response.json({
+        ok: true,
+        pause_state: { active: false },
+        note: '当前没有处于暂停状态。'
+      });
+    }
+
+    await performResume(env, adminId);
 
     return Response.json({
       ok: true,
@@ -12318,6 +12877,7 @@ function buildUserListPage() {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>访客列表</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   body { font-family: -apple-system, "Segoe UI", sans-serif; margin: 0; background: #0f141a; color: #e8edf2; padding-top: 104px; }
   html { scroll-padding-top: 114px; }
@@ -12929,9 +13489,19 @@ async function getPauseState(env) {
 
     // 先翻牌再清状态：中途被打断时状态还在，下一次读到
     // 过期状态会续跑剩余记录；通知仍只由抢到的一方发。
-    await flipPauseCards(env);
+    // 整体包 try：翻牌是写操作（逐卡外部调用 + 删记录），
+    // 却挂在读路径上内联执行，异常绝不能逃出本函数拖死
+    // 触发它的那条更新——失败只记日志，状态保留待续跑。
+    try {
+      await flipPauseCards(env);
 
-    await dbConfigDelete(PAUSE_STATE_KEY, env);
+      await dbConfigDelete(PAUSE_STATE_KEY, env);
+    } catch (error) {
+      console.error(
+        '熔断到期翻牌或清状态失败（下次触发续跑）：',
+        error?.message || error
+      );
+    }
 
     if (wonNotice) {
       await notifyPrimaryAdmins(
@@ -12975,7 +13545,12 @@ async function stopPause(env) {
 // 熔断回复发送成功时写入。逐张翻牌后才删对应记录，
 // 中途被打断可由下一次恢复续跑：牌被访客自行删掉、
 // 机器人被拉黑等都静默跳过。
-async function flipPauseCards(env) {
+// 单次最多处理 limit 张（默认 10）：翻牌挂在读路径上
+// （惰性到期、闸门、菜单）内联执行，必须给单次请求
+// 留出正文处理的子请求预算；剩余记录保留，下一次
+// 触发继续翻。返回值 { remaining, settled }：本轮后
+// 剩余未翻数与本轮已处理（删记录）数。
+async function flipPauseCards(env, limit = 10) {
   let rows = [];
 
   try {
@@ -12993,7 +13568,7 @@ async function flipPauseCards(env) {
       error?.message || error
     );
 
-    return;
+    return { remaining: 0, settled: 0 };
   }
 
   // 恢复文案循环外读一次：逐卡读同一键是纯浪费，
@@ -13003,7 +13578,16 @@ async function flipPauseCards(env) {
     env
   );
 
+  let processed = 0;
+  let settled = 0;
+
   for (const row of rows) {
+    if (processed >= limit) {
+      break;
+    }
+
+    processed += 1;
+
     const key = String(row.key || '');
 
     const userId = key.slice('pausemsg:'.length);
@@ -13013,8 +13597,12 @@ async function flipPauseCards(env) {
     if (!userId || !messageId) {
       await dbConfigDelete(key, env);
 
+      settled += 1;
+
       continue;
     }
+
+    let editError = null;
 
     try {
       await telegramApi(
@@ -13026,14 +13614,27 @@ async function flipPauseCards(env) {
           text: restoredText
         }
       );
-    } catch {
-      /* 翻牌失败不打扰主流程 */
+    } catch (error) {
+      editError = error;
     }
 
     // 记录在翻牌尝试之后才删：进程中途被打断时，没轮到的
     // 记录还在，下一次恢复会续跑（已翻的编辑同文案无副作用）。
-    await dbConfigDelete(key, env);
+    // 且只有翻成功、或失败是带 errorCode 的终局错误（消息
+    // 已删、被拉黑、已是恢复文案等）才删；无 errorCode 的
+    // 瞬时失败（网络抖动、子请求超限）保留记录下一次再翻，
+    // 否则访客端会永远留着「请稍后再试」。
+    if (!editError || editError.errorCode) {
+      await dbConfigDelete(key, env);
+
+      settled += 1;
+    }
   }
+
+  return {
+    remaining: rows.length - settled,
+    settled
+  };
 }
 
 function describePauseRemaining(state) {
@@ -13079,7 +13680,16 @@ async function performPause(env, minutes, byAdminId) {
 async function performResume(env, byAdminId) {
   // 先翻牌、后清状态：翻牌中途被打断时暂停状态还在，
   // 管理员再发一次 /resume 即可续跑剩余记录。
-  await flipPauseCards(env);
+  // 分批翻（单批上限见 flipPauseCards）：循环到翻完或
+  // 达到批数上限，剩余记录留下一次触发续翻；某一整批
+  // 一张都没翻动（多半是持续性故障）就停下，不空转。
+  for (let pass = 0; pass < 20; pass += 1) {
+    const flip = await flipPauseCards(env);
+
+    if (flip.remaining <= 0 || flip.settled <= 0) {
+      break;
+    }
+  }
 
   await stopPause(env);
 
@@ -13105,8 +13715,9 @@ async function describePauseStateForPanel(env) {
 }
 
 // 暂停闸门：置于去重之前。返回 true 表示这条更新应被丢弃。
-// 只拦非管理员的私聊侧更新（消息 / 编辑 / 反应 / 按钮）；
-// 管理员与管理群侧永远放行，my_chat_member 等事件不拦。
+// 拦非管理员私聊的新消息与按钮；编辑与反应只过闸门
+// 检查、照常放行同步。管理员与管理群侧永远放行，
+// my_chat_member 等事件不拦。
 async function pauseGateDrops(update, env) {
   let actorId = '';
   let kind = '';
@@ -13153,7 +13764,20 @@ async function pauseGateDrops(update, env) {
     return false;
   }
 
-  const state = await getPauseState(env);
+  let state = null;
+
+  try {
+    state = await getPauseState(env);
+  } catch (error) {
+    // 读状态本身失败时按未熔断放行：闸门位于每条更新
+    // 的最前沿，绝不能因熔断子系统抖动吞掉正常更新。
+    console.error(
+      '读取熔断状态失败，按未熔断放行：',
+      error?.message || error
+    );
+
+    return false;
+  }
 
   if (!state) {
     return false;

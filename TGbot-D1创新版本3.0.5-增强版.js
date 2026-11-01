@@ -10653,6 +10653,30 @@ function applyVmode() {
 }
 document.getElementById('f_verifymode').addEventListener('change', applyVmode);
 
+// 数字框滚轮调值时只调数值、不滚页面：聚焦中的数字框收到滚轮时
+// 拦下默认行为（部分 WebView 会数值与页面一起滚），按步长改值并钳到 min/max。
+var numInputs = document.querySelectorAll('input[type="number"]');
+for (var ni = 0; ni < numInputs.length; ni++) {
+  numInputs[ni].addEventListener('wheel', function (ev) {
+    if (ev.ctrlKey || !ev.deltaY) return;
+    if (document.activeElement !== this) return;
+    ev.preventDefault();
+    var step = parseFloat(this.step) || 1;
+    var cur = parseFloat(this.value);
+    if (isNaN(cur)) cur = parseFloat(this.min) || 0;
+    var next = cur + (ev.deltaY < 0 ? step : -step);
+    var mn = parseFloat(this.min);
+    var mx = parseFloat(this.max);
+    if (!isNaN(mn) && next < mn) next = mn;
+    if (!isNaN(mx) && next > mx) next = mx;
+    if (String(next) !== this.value) {
+      this.value = String(next);
+      this.dispatchEvent(new Event('input', { bubbles: true }));
+      this.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }, { passive: false });
+}
+
 fetch('/api/config?' + qs.toString())
   .then(function (r) { return r.json(); })
   .then(function (d) {

@@ -469,12 +469,23 @@ function validateEnvironment(env) {
 /*                             Telegram API 封装                               */
 /* -------------------------------------------------------------------------- */
 
+// 非幂等方法（发出即产生新消息/新话题）：网络异常或 5xx 时
+// 不能重试——请求可能已被 Telegram 处理、只是响应丢失，
+// 重试会重复投递且重复副本没有配对记录。429 表示请求被拒
+// 未处理，仍可重试；其余方法（编辑/删除/读取等）维持重试。
+const NON_IDEMPOTENT_METHODS = new Set([
+  'sendMessage',
+  'copyMessage',
+  'createForumTopic'
+]);
+
 async function telegramApi(
   token,
   method,
   params = {},
   attempt = 0
 ) {
+  const mayRetry = !NON_IDEMPOTENT_METHODS.has(method);
   const url =
     `https://api.telegram.org/bot${token}/${method}`;
 
@@ -490,7 +501,7 @@ async function telegramApi(
       signal: AbortSignal.timeout(15000)
     });
   } catch (error) {
-    if (attempt < 2) {
+    if (attempt < 2 && mayRetry) {
       await sleep(500 * (attempt + 1));
 
       return telegramApi(
@@ -542,7 +553,8 @@ async function telegramApi(
 
     if (
       response.status >= 500 &&
-      attempt < 2
+      attempt < 2 &&
+      mayRetry
     ) {
       await sleep(500 * (attempt + 1));
 
@@ -652,6 +664,12 @@ async function dbMigrate(env) {
     )
     `,
     `
+    CREATE INDEX IF NOT EXISTS idx_users_state_updated
+      ON users (user_state, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_users_created_at
+      ON users (created_at);
+    CREATE INDEX IF NOT EXISTS idx_users_updated_at
+      ON users (updated_at);
     CREATE INDEX IF NOT EXISTS idx_users_topic_id
     ON users(topic_id)
     `,
@@ -802,13 +820,22 @@ async function cleanupDatabase(env) {
       ).bind(cutoff)
     ]);
 
-    await cleanupExpiredUsers(env, now);
-
-    await cleanupReverifyExpiredUsers(env, now);
-
-    await cleanupStaleMenuTracks(env);
-
-    await sweepEphemeralNotices(env);
+    // 各类清扫互相隔离：一类抛错不再拖累同轮其余清扫。
+    for (const sweep of [
+      () => cleanupExpiredUsers(env, now),
+      () => cleanupReverifyExpiredUsers(env, now),
+      () => cleanupStaleMenuTracks(env),
+      () => sweepEphemeralNotices(env)
+    ]) {
+      try {
+        await sweep();
+      } catch (error) {
+        console.error(
+          '单项清扫失败（继续其余清扫）：',
+          error?.message || error
+        );
+      }
+    }
   } catch (error) {
     console.error(
       '清理数据库失败：',
@@ -904,11 +931,19 @@ async function cleanupReverifyExpiredUsers(env, now) {
       )
       .all();
 
+  // 协管员名单整轮只读一次（逐行 isAdminUser 会逐行读配置）。
+  const coAdminSet = new Set(
+    (await getAuthorizedAdmins(env)).map(String)
+  );
+
+  const isAdminRow = (id) =>
+    isPrimaryAdmin(id, env) || coAdminSet.has(String(id));
+
   for (const row of result?.results || []) {
     const userId = String(row.user_id);
 
     // 管理员（含协管员）账号永不改动。
-    if (await isAdminUser(userId, env)) {
+    if (isAdminRow(userId)) {
       continue;
     }
 
@@ -970,11 +1005,19 @@ async function cleanupExpiredUsers(env, now) {
       )
       .all();
 
+  // 协管员名单整轮只读一次（逐行 isAdminUser 会逐行读配置）。
+  const coAdminSet = new Set(
+    (await getAuthorizedAdmins(env)).map(String)
+  );
+
+  const isAdminRow = (id) =>
+    isPrimaryAdmin(id, env) || coAdminSet.has(String(id));
+
   for (const row of result?.results || []) {
     const userId = String(row.user_id);
 
     // 管理员（含协管员）账号永不清理。
-    if (await isAdminUser(userId, env)) {
+    if (isAdminRow(userId)) {
       continue;
     }
 
@@ -1014,6 +1057,21 @@ async function cleanupExpiredUsers(env, now) {
       .bind(userId)
       .run();
 
+    // 配对/提示行与删人路径同口径一并清（此前残留到 90 天清扫）。
+    await env.TG_BOT_DB.prepare(
+      'DELETE FROM messages ' +
+      'WHERE user_id = ? ' +
+      'AND (message_id LIKE ? OR ' +
+      '(message_id LIKE ? AND text LIKE ?))'
+    )
+      .bind(
+        REACTION_MAP_USER,
+        `p:${userId}:%`,
+        't:%',
+        `${userId}:%`
+      )
+      .run();
+
     await dbConfigDelete(
       `botblocked:${userId}`,
       env
@@ -1041,6 +1099,16 @@ async function cleanupExpiredUsers(env, now) {
 
     await dbConfigDelete(
       `blocknotice:${userId}`,
+      env
+    );
+
+    await dbConfigDelete(
+      `quizlock:${userId}`,
+      env
+    );
+
+    await dbConfigDelete(
+      `copyfail:${userId}`,
       env
     );
   }
@@ -1134,6 +1202,24 @@ async function dbConfigDelete(key, env) {
   await env.TG_BOT_DB.prepare(
     'DELETE FROM config WHERE key = ?'
   ).bind(key).run();
+}
+
+// 原子条件写：值仍是调用方读到的那份才写入，返回是否写成功。
+// 给「读-改-写」类计数提供 CAS 基础，防并发丢更新。
+async function dbConfigPutIfValue(
+  key,
+  oldValue,
+  newValue,
+  env
+) {
+  const result = await env.TG_BOT_DB.prepare(
+    'UPDATE config SET value = ? ' +
+    'WHERE key = ? AND value = ?'
+  )
+    .bind(String(newValue), key, String(oldValue))
+    .run();
+
+  return !result?.meta || result.meta.changes > 0;
 }
 
 // 原子条件删：值仍是调用方读到的那份才删，返回是否真的删掉。
@@ -1502,10 +1588,22 @@ function looksDangerousRegex(source) {
   );
 }
 
+// 已编译正则缓存：关键词/自动回复规则在每条消息上都要
+// 匹配，此前逐条消息重新编译全部规则。mergeRegexFlags
+// 已禁 g/y，test() 无状态，缓存实例可安全共享。
+const regexRuleCache = new Map();
+
 function buildRegexRule(
   pattern,
   defaultFlags = 'i'
 ) {
+  const cacheKey =
+    String(defaultFlags) + '\n' + String(pattern || '');
+
+  if (regexRuleCache.has(cacheKey)) {
+    return regexRuleCache.get(cacheKey);
+  }
+
   let source = String(pattern || '').trim();
   let flags = defaultFlags;
 
@@ -1560,7 +1658,15 @@ function buildRegexRule(
     );
   }
 
-  return new RegExp(source, flags);
+  const compiled = new RegExp(source, flags);
+
+  if (regexRuleCache.size >= 300) {
+    regexRuleCache.clear();
+  }
+
+  regexRuleCache.set(cacheKey, compiled);
+
+  return compiled;
 }
 
 function validateRegexPattern(pattern) {
@@ -1679,62 +1785,65 @@ async function matchAutoReply(text, env) {
 }
 
 async function getFilterConfig(env) {
+  // 八个开关一次 IN 查询读回（此前逐个 getConfig 是 8 次往返，
+  // 且在每条访客消息的热路径上）。读失败时全部按默认开启
+  // 处理，与转发热路径「读失败不丢消息」的口径一致。
+  const keys = [
+    'enable_image_forwarding',
+    'enable_link_forwarding',
+    'enable_text_forwarding',
+    'enable_audio_forwarding',
+    'enable_sticker_forwarding',
+    'enable_user_forwarding',
+    'enable_group_forwarding',
+    'enable_channel_forwarding'
+  ];
+
+  const stored = {};
+
+  try {
+    const result = await env.TG_BOT_DB.prepare(
+      'SELECT key, value FROM config ' +
+      'WHERE key IN (?, ?, ?, ?, ?, ?, ?, ?)'
+    )
+      .bind(...keys)
+      .all();
+
+    for (const row of result?.results || []) {
+      stored[String(row.key)] = row.value;
+    }
+  } catch (error) {
+    console.error(
+      '读取类型过滤配置失败（按默认开启处理）：',
+      error?.message || error
+    );
+  }
+
+  const pick = (key) =>
+    stored[key] !== undefined
+      ? stored[key]
+      : (DEFAULTS[key] !== undefined
+          ? DEFAULTS[key]
+          : 'true');
+
   return {
-    media: toBoolText(
-      await getConfig(
-        'enable_image_forwarding',
-        env,
-        'true'
-      )
-    ),
-    link: toBoolText(
-      await getConfig(
-        'enable_link_forwarding',
-        env,
-        'true'
-      )
-    ),
-    text: toBoolText(
-      await getConfig(
-        'enable_text_forwarding',
-        env,
-        'true'
-      )
-    ),
+    media: toBoolText(pick('enable_image_forwarding')),
+    link: toBoolText(pick('enable_link_forwarding')),
+    text: toBoolText(pick('enable_text_forwarding')),
     audio_voice: toBoolText(
-      await getConfig(
-        'enable_audio_forwarding',
-        env,
-        'true'
-      )
+      pick('enable_audio_forwarding')
     ),
     sticker_gif: toBoolText(
-      await getConfig(
-        'enable_sticker_forwarding',
-        env,
-        'true'
-      )
+      pick('enable_sticker_forwarding')
     ),
     user_forward: toBoolText(
-      await getConfig(
-        'enable_user_forwarding',
-        env,
-        'true'
-      )
+      pick('enable_user_forwarding')
     ),
     group_forward: toBoolText(
-      await getConfig(
-        'enable_group_forwarding',
-        env,
-        'true'
-      )
+      pick('enable_group_forwarding')
     ),
     channel_forward: toBoolText(
-      await getConfig(
-        'enable_channel_forwarding',
-        env,
-        'true'
-      )
+      pick('enable_channel_forwarding')
     )
   };
 }
@@ -2276,20 +2385,42 @@ async function createInfoCard(
     }
   );
 
-  await dbUserUpdate(
-    payload.userId,
-    {
-      info_card_message_id:
-        String(sent.message_id),
-      user_info: {
-        name: payload.displayName,
-        username: payload.usernameDisplay,
-        username_raw: payload.usernameRaw,
-        first_message_date: message.date
+  // 卡片已经发出：写回失败先原地重试写库，不要让外层
+  // 兜底重发一张新卡（孤儿卡没有记录、永远收不回来）。
+  let writeError = null;
+
+  for (let w = 0; w < 3; w += 1) {
+    try {
+      await dbUserUpdate(
+        payload.userId,
+        {
+          info_card_message_id:
+            String(sent.message_id),
+          user_info: {
+            name: payload.displayName,
+            username: payload.usernameDisplay,
+            username_raw: payload.usernameRaw,
+            first_message_date: message.date
+          }
+        },
+        env
+      );
+
+      writeError = null;
+
+      break;
+    } catch (error) {
+      writeError = error;
+
+      if (w < 2) {
+        await sleep(300);
       }
-    },
-    env
-  );
+    }
+  }
+
+  if (writeError) {
+    throw writeError;
+  }
 
   return sent.message_id;
 }
@@ -2747,6 +2878,12 @@ async function copyMessageWithReplyFallback(
       }
     );
   } catch (firstError) {
+    // 网络类错误没有 errorCode：请求结果未知（可能已送达），
+    // 不再降级重发，避免同一条消息出现两份。
+    if (!firstError?.errorCode) {
+      throw firstError;
+    }
+
     if (!replyParameters.quote) {
       return telegramApi(
         token,
@@ -2770,7 +2907,11 @@ async function copyMessageWithReplyFallback(
           reply_parameters: wholeReply
         }
       );
-    } catch {
+    } catch (secondError) {
+      if (!secondError?.errorCode) {
+        throw secondError;
+      }
+
       return telegramApi(
         token,
         'copyMessage',
@@ -3429,6 +3570,12 @@ function isNotModifiedError(error) {
 function buildEditedMedia(source) {
   const extra = {};
 
+  // 剧透遮罩随媒体一并带过去：editMessageMedia 缺省无剧透，
+  // 不带就会把原本遮住的图片/视频直接显露。
+  const spoiler = source.has_spoiler
+    ? { has_spoiler: true }
+    : {};
+
   if (source.caption !== undefined) {
     extra.caption = source.caption;
   }
@@ -3445,7 +3592,8 @@ function buildEditedMedia(source) {
         source.photo[
           source.photo.length - 1
         ].file_id,
-      ...extra
+      ...extra,
+      ...spoiler
     };
   }
 
@@ -3453,7 +3601,8 @@ function buildEditedMedia(source) {
     return {
       type: 'video',
       media: source.video.file_id,
-      ...extra
+      ...extra,
+      ...spoiler
     };
   }
 
@@ -3461,7 +3610,8 @@ function buildEditedMedia(source) {
     return {
       type: 'animation',
       media: source.animation.file_id,
-      ...extra
+      ...extra,
+      ...spoiler
     };
   }
 
@@ -3469,7 +3619,8 @@ function buildEditedMedia(source) {
     return {
       type: 'document',
       media: source.document.file_id,
-      ...extra
+      ...extra,
+      ...spoiler
     };
   }
 
@@ -3937,9 +4088,11 @@ ${versionLine}${pauseLine}
     ]);
   }
 
-  const reply_markup = {
-    inline_keyboard: keyboard
-  };
+  // 五个按钮全部关掉时键盘为空：Telegram 会以
+  // reply markup 为空拒收整条菜单，此时只发正文不带键盘。
+  const reply_markup = keyboard.length
+    ? { inline_keyboard: keyboard }
+    : undefined;
 
   const menuMessageId = await renderMenu(env, {
     chatId,
@@ -4105,6 +4258,86 @@ async function handleStart(
 // 问答验证防爆破：连续答错达上限后锁定一段时间。
 // 问答是静态共享答案，没有次数限制时可被在线穷举。
 
+// 问答答错计数（CAS 版）：基于读到的原值条件写入，写冲突
+// 就重读重试，避免并发答错互相覆盖、把有效猜测次数放大。
+// 返回本次计数（达到上限时已顺带写入锁定）；并发中已被
+// 其他请求锁定时返回 -1，调用方按锁定中静默处理。
+async function recordQuizWrongAttempt(
+  lockKey,
+  initialRaw,
+  initialState,
+  maxAttempts,
+  lockMin,
+  env
+) {
+  let raw = initialRaw;
+  let state = initialState;
+
+  for (let casTry = 0; casTry < 5; casTry += 1) {
+    if (state && Number(state.until || 0) > Date.now()) {
+      return -1;
+    }
+
+    const attempts = Number(state?.n || 0) + 1;
+    const locked = attempts >= maxAttempts;
+    const nextValue = JSON.stringify(
+      locked
+        ? {
+            n: 0,
+            until: Date.now() + lockMin * 60 * 1000
+          }
+        : { n: attempts, until: 0 }
+    );
+
+    let wrote = false;
+
+    if (raw === null || raw === undefined) {
+      wrote = await dbConfigClaim(lockKey, nextValue, env);
+    } else {
+      wrote = await dbConfigPutIfValue(
+        lockKey,
+        raw,
+        nextValue,
+        env
+      );
+    }
+
+    if (wrote) {
+      return attempts;
+    }
+
+    raw = await dbConfigGet(lockKey, env);
+    state = null;
+
+    if (raw) {
+      try {
+        state = JSON.parse(raw);
+      } catch {
+        state = null;
+      }
+    }
+  }
+
+  // 多次冲突后兜底：以最新读到的计数无条件写入（尽力而为）。
+  const attempts = Number(state?.n || 0) + 1;
+  const locked = attempts >= maxAttempts;
+
+  await dbConfigPut(
+    lockKey,
+    JSON.stringify(
+      locked
+        ? {
+            n: 0,
+            until: Date.now() + lockMin * 60 * 1000
+          }
+        : { n: attempts, until: 0 }
+    ),
+    env
+  );
+
+  return attempts;
+}
+
 async function handleVerification(
   chatId,
   answer,
@@ -4168,19 +4401,20 @@ async function handleVerification(
       1440
     );
 
-    const attempts =
-      Number(lockState?.n || 0) + 1;
+    const attempts = await recordQuizWrongAttempt(
+      lockKey,
+      lockRaw,
+      lockState,
+      quizMaxAttempts,
+      quizLockMin,
+      env
+    );
+
+    if (attempts === -1) {
+      return false;
+    }
 
     if (attempts >= quizMaxAttempts) {
-      await dbConfigPut(
-        lockKey,
-        JSON.stringify({
-          n: 0,
-          until: Date.now() + quizLockMin * 60 * 1000
-        }),
-        env
-      );
-
       await telegramApi(
         env.BOT_TOKEN,
         'sendMessage',
@@ -4194,12 +4428,6 @@ async function handleVerification(
 
       return false;
     }
-
-    await dbConfigPut(
-      lockKey,
-      JSON.stringify({ n: attempts, until: 0 }),
-      env
-    );
 
     await telegramApi(
       env.BOT_TOKEN,
@@ -4260,10 +4488,14 @@ async function getAllConfigMap(env) {
   const map = {};
 
   try {
+    // 只读静态设置键（不含冒号）：pass:/ephem:/copyfail: 等
+    // 按访客生成的动态键不在面板取值范围内，历史访客越多
+    // 全表读越大，这里从源头排除。
     const result = await env.TG_BOT_DB.prepare(
-      'SELECT key, value FROM config WHERE key LIKE ?'
+      'SELECT key, value FROM config ' +
+      'WHERE key NOT LIKE ?'
     )
-      .bind('%')
+      .bind('%:%')
       .all();
 
     for (const row of result?.results || []) {
@@ -4826,7 +5058,9 @@ async function sendTestVerifyPrompt(
         '🧪 Turnstile 测试验证（测试模式）：' +
         '完成验证只会显示测试结果，' +
         '不会修改任何访客的验证状态。' +
-        '链接 10 分钟内有效，' +
+        '链接 ' +
+        Math.round((await verifyLinkTtlMs(env)) / 60000) +
+        ' 分钟内有效，' +
         '需要新链接随时再发 /testverify。',
       reply_markup: {
         inline_keyboard: [
@@ -4897,7 +5131,9 @@ async function sendTurnstilePrompt(
       chat_id: chatId,
       text:
         '请点击下方按钮完成人机验证，' +
-        '链接 10 分钟内有效。' +
+        '链接 ' +
+        Math.round((await verifyLinkTtlMs(env)) / 60000) +
+        ' 分钟内有效。' +
         '验证通过后即可发送消息。',
       reply_markup: {
         inline_keyboard: [
@@ -4979,7 +5215,8 @@ function renderVerifyPage(env, params) {
           e: payload.e,
           s: payload.s,
           m: payload.m,
-          token: token
+          token: token,
+          initData: (window.Telegram && Telegram.WebApp && Telegram.WebApp.initData) || ''
         })
       });
 
@@ -4999,6 +5236,8 @@ function renderVerifyPage(env, params) {
         if (window.Telegram && Telegram.WebApp) {
           Telegram.WebApp.ready();
         }
+      } else if (data.error === 'bad_initdata') {
+        setStatus('❌ 请从 Telegram 里打开这条验证链接，不要用浏览器直接打开，也不要使用别人转发的链接。');
       } else {
         setStatus('❌ 验证未通过，请刷新页面重试。');
 
@@ -5122,7 +5361,9 @@ async function handlePassPage(request, env) {
     status: 200,
     headers: {
       'content-type': 'text/html; charset=utf-8',
-      'cache-control': 'no-store'
+      'cache-control': 'no-store',
+      'referrer-policy': 'no-referrer',
+      'x-content-type-options': 'nosniff'
     }
   });
 }
@@ -5177,6 +5418,19 @@ async function handlePassConfirm(request, env) {
     return jsonResponse(403, { ok: false, error: 'blocked' });
   }
 
+  // 先置已验证、再消费通行证（与验证确认路径同一顺序）：
+  // 中途失败时证还在，访客可以重试，不会证没了人没过。
+  const wasVerified =
+    user.user_state === USER_STATE.VERIFIED;
+
+  if (!wasVerified) {
+    await dbUserUpdate(
+      u,
+      { user_state: USER_STATE.VERIFIED },
+      env
+    );
+  }
+
   await dbConfigDelete(`pass:${u}`, env);
 
   if (rec.m) {
@@ -5185,12 +5439,7 @@ async function handlePassConfirm(request, env) {
 
   await cleanupAfterVerified(env, u);
 
-  if (user.user_state !== USER_STATE.VERIFIED) {
-    await dbUserUpdate(
-      u,
-      { user_state: USER_STATE.VERIFIED },
-      env
-    );
+  if (!wasVerified) {
 
     try {
       const successSent = await telegramApi(env.BOT_TOKEN, 'sendMessage', {
@@ -5274,6 +5523,8 @@ async function handleVerifyPage(
       headers: {
         'content-type':
           'text/html; charset=utf-8',
+        'referrer-policy': 'no-referrer',
+        'x-content-type-options': 'nosniff',
         'cache-control': 'no-store'
       }
     }
@@ -5350,6 +5601,21 @@ async function handleVerifyConfirm(
     return jsonResponse(403, {
       ok: false,
       error: 'bad_signature'
+    });
+  }
+
+  // 与通行证同一口径：链接不再是纯持有凭证——校验打开者
+  // 身份（Mini App initData），必须与链接绑定的访客一致，
+  // 转发出去的链接别人点开也用不了。
+  const openerId = await telegramInitDataUserId(
+    body?.initData,
+    env.BOT_TOKEN
+  );
+
+  if (!openerId || openerId !== u) {
+    return jsonResponse(403, {
+      ok: false,
+      error: 'bad_initdata'
     });
   }
 
@@ -6214,14 +6480,23 @@ async function handlePrivateMessage(
     await matchAutoReply(text, env);
 
   if (autoReply) {
-    await telegramApi(
-      env.BOT_TOKEN,
-      'sendMessage',
-      {
-        chat_id: chatId,
-        text: autoReply
-      }
-    );
+    // 自动回复只是前置招呼：发送失败不能拖垮后面的正式转发
+    // （update 已被消费，异常逃出这条消息就永久丢了）。
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: chatId,
+          text: autoReply
+        }
+      );
+    } catch (error) {
+      console.error(
+        '发送自动回复失败（继续转发）：',
+        error?.message || error
+      );
+    }
   }
 
   if (!user.relay_exempt) {
@@ -6608,6 +6883,44 @@ async function handleAdminCommand(
     );
 
     return true;
+  }
+
+  // 目标保护：带访客目标的命令不得作用于管理员账号
+  // （与资料卡回调、网页操作的口径一致；此前命令路径缺此校验，
+  // 协管员可用显式 ID 封禁主管理员或改绑话题）。
+  if (
+    [
+      'reverify',
+      'note',
+      'notedelete',
+      'ban',
+      'unban',
+      'card',
+      'terminate'
+    ].includes(parsed.command)
+  ) {
+    const guardTarget =
+      parsed.command === 'note' ||
+      parsed.command === 'notedelete'
+        ? await resolveTopicUserId(message, env)
+        : await resolveTopicUserId(
+            message,
+            env,
+            parsed.argument
+          );
+
+    if (
+      guardTarget &&
+      (await isAdminUser(guardTarget, env))
+    ) {
+      await sendTopicNotice(
+        message,
+        '不能对管理员账号执行此操作。',
+        env
+      );
+
+      return true;
+    }
   }
 
   if (parsed.command === 'reverify') {
@@ -7389,6 +7702,26 @@ const topicId =
 /*                               编辑消息处理                                    */
 /* -------------------------------------------------------------------------- */
 
+// 回退通知的正文截断：转义后的文本按预算截断并避开切碎
+// HTML 实体，保证整条通知不超过 Telegram 的 4096 字上限。
+function capEscapedText(escaped, max) {
+  const chars = [...String(escaped)];
+
+  if (chars.length <= max) {
+    return escaped;
+  }
+
+  let out = chars.slice(0, max).join('');
+  const lastAmp = out.lastIndexOf('&');
+  const lastSemi = out.lastIndexOf(';');
+
+  if (lastAmp > lastSemi) {
+    out = out.slice(0, lastAmp);
+  }
+
+  return out + '…（内容过长，已截断）';
+}
+
 async function handleRelayEditedMessage(
   editedMessage,
   env
@@ -7493,10 +7826,10 @@ async function handleRelayEditedMessage(
 <code>${escapeHtml(originalDate)}</code>
 
 <b>原始内容：</b>
-${escapeHtml(originalText)}
+${capEscapedText(escapeHtml(originalText), 1000)}
 
 <b>修改后的内容：</b>
-${escapeHtml(newContent)}
+${capEscapedText(escapeHtml(newContent), 2600)}
   `.trim();
 
   const pair = await dbMessageDataGet(
@@ -7660,10 +7993,10 @@ async function handleAdminEditedReply(
 <code>${escapeHtml(editTime)}</code>
 
 <b>原消息内容：</b>
-${escapeHtml(stored.text || '[原始内容未保存]')}
+${capEscapedText(escapeHtml(stored.text || '[原始内容未保存]'), 1000)}
 
 <b>新消息内容：</b>
-${escapeHtml(newText)}
+${capEscapedText(escapeHtml(newText), 2600)}
   `.trim();
 
   const pair = await dbMessageDataGet(
@@ -7915,7 +8248,7 @@ async function handleUserCardCallback(
             'sendMessage',
             {
               chat_id: targetUserId,
-              text: await getConfig(
+              text: await textConfig(
                 'verify_success_text',
                 env
               )
@@ -8988,6 +9321,16 @@ async function purgeManagedUser(
     env
   );
 
+  await dbConfigDelete(
+    `quizlock:${userId}`,
+    env
+  );
+
+  await dbConfigDelete(
+    `copyfail:${userId}`,
+    env
+  );
+
   return topicDeleted;
 }
 
@@ -9598,7 +9941,9 @@ async function signedPageResponse(
       {
         status: 403,
         headers: {
-          'content-type': 'text/html; charset=utf-8'
+          'content-type': 'text/html; charset=utf-8',
+          'referrer-policy': 'no-referrer',
+          'x-content-type-options': 'nosniff'
         }
       }
     );
@@ -9608,7 +9953,9 @@ async function signedPageResponse(
     status: 200,
     headers: {
       'content-type': 'text/html; charset=utf-8',
-      'cache-control': 'no-store'
+      'cache-control': 'no-store',
+      'referrer-policy': 'no-referrer',
+      'x-content-type-options': 'nosniff'
     }
   });
 }
@@ -9726,10 +10073,16 @@ async function handleUserListApi(request, env) {
     env.ADMIN_GROUP_ID || ''
   ).replace(/^-100/, '');
 
+  // 列表最多返回最近活跃的 1000 人：把总数与截断标志
+  // 一并给出，页面会明示截断，不再静默看不见老访客。
+  const totalUsers = await countUsersWhere(env, '', []);
+
   return Response.json({
     ok: true,
     group: groupLinkId,
     users,
+    total: totalUsers,
+    truncated: totalUsers > users.length,
     uiDefaults: {
       sort:
         await getConfig('userlist_sort', env, 'active'),
@@ -10024,7 +10377,7 @@ function buildGuidePage() {
     <h2>🛡 验证</h2>
     <p>验证是用来挡垃圾机器人和广告号的：没通过验证的人，发什么都不会转进群里。</p>
     <ul>
-      <li><b class=\"k\">Turnstile 小程序验证（推荐）：</b>访客点「开始验证」按钮，弹出一个小页面自动完成人机校验，几秒通过，体验最顺。</li>
+      <li><b class=\"k\">Turnstile 小程序验证（推荐）：</b>访客点「开始验证」按钮，弹出一个小页面自动完成人机校验，几秒通过，体验最顺。验证链接绑定访客本人，必须在 Telegram 里点开，转发给别人或用浏览器打开都用不了。</li>
       <li><b class=\"k\">静态问答验证：</b>你出一道题，访客答对才放行；答案可以准备多个，用竖线 <code>|</code> 分隔，答中任意一个都算对。连着答错 5 次会被锁定 30 分钟（防有人对着答案穷举），锁定期间他发什么都不会有回应，过后自动解锁。次数和时长可以在管理台「基础配置」里改。</li>
       <li><b class=\"k\">在哪里切换：</b>网页管理台 → 基础配置 → 验证方式。选了 Turnstile 后，问题和答案两项会自动隐藏；如果还没配好 Turnstile 密钥，机器人会自动用问答模式兜底，不会把人卡死。</li>
       <li><b class=\"k\">让某人重新验证：</b>打开他的话题，发送 <code>/reverify</code>，他下一次发消息前要重新过一遍验证。</li>
@@ -10664,7 +11017,8 @@ for (var ni = 0; ni < numInputs.length; ni++) {
     var step = parseFloat(this.step) || 1;
     var cur = parseFloat(this.value);
     if (isNaN(cur)) cur = parseFloat(this.min) || 0;
-    var next = cur + (ev.deltaY < 0 ? step : -step);
+    var steps = ev.deltaMode === 2 ? 5 : 1;
+    var next = cur + (ev.deltaY < 0 ? step * steps : -step * steps);
     var mn = parseFloat(this.min);
     var mx = parseFloat(this.max);
     if (!isNaN(mn) && next < mn) next = mn;
@@ -11159,6 +11513,32 @@ async function handleConfigApi(request, env) {
     return def !== undefined ? def : (DEFAULTS[key] ?? '');
   };
 
+  // 展示值与运行时同一口径（trunc + 范围钳制；两个 TTL
+  // 还要求整数，非整数运行时按关闭处理，展示同步为 0），
+  // 免得带外坏值在面板上显示成运行时根本不会用的数。
+  const clampShow = (key, def, min, max) => {
+    const n = Number(cfg(key, String(def)));
+
+    if (!Number.isFinite(n)) {
+      return def;
+    }
+
+    return Math.min(
+      max,
+      Math.max(min, Math.trunc(n))
+    );
+  };
+
+  const ttlShow = (key) => {
+    const n = Number(cfg(key, '0'));
+
+    if (!Number.isInteger(n)) {
+      return 0;
+    }
+
+    return Math.min(3650, Math.max(0, n));
+  };
+
   const filters = await getFilterConfig(env);
   const rules = await getAutoReplyRules(env);
 
@@ -11174,14 +11554,8 @@ async function handleConfigApi(request, env) {
     pause_reply_text: cfg('pause_reply_text', '请稍后再试'),
     pause_state:
       await describePauseStateForPanel(env),
-    verified_ttl_days:
-      Number(
-        cfg('verified_ttl_days', '0')
-      ) || 0,
-    reverify_ttl_days:
-      Number(
-        cfg('reverify_ttl_days', '0')
-      ) || 0,
+    verified_ttl_days: ttlShow('verified_ttl_days'),
+    reverify_ttl_days: ttlShow('reverify_ttl_days'),
     block_threshold: await getBlockThreshold(env),
     filters: {
       enable_image_forwarding: filters.media,
@@ -11202,20 +11576,16 @@ async function handleConfigApi(request, env) {
     })),
     authorizedAdmins:
       await getAuthorizedAdmins(env),
-    relay_burst:
-      Number(cfg('relay_burst', '30')) || 30,
+    relay_burst: clampShow('relay_burst', 30, 1, 1000),
     relay_refill_per_sec:
-      Number(cfg('relay_refill_per_sec', '5')) || 5,
-    pass_ttl_min:
-      Number(cfg('pass_ttl_min', '30')) || 30,
+      clampShow('relay_refill_per_sec', 5, 1, 100),
+    pass_ttl_min: clampShow('pass_ttl_min', 30, 1, 1440),
     verify_link_min:
-      Number(cfg('verify_link_min', '10')) || 10,
+      clampShow('verify_link_min', 10, 1, 120),
     quiz_max_attempts:
-      Number(cfg('quiz_max_attempts', '5')) || 5,
-    quiz_lock_min:
-      Number(cfg('quiz_lock_min', '30')) || 30,
-    notice_stay_sec:
-      Number(cfg('notice_stay_sec', '5')) || 5,
+      clampShow('quiz_max_attempts', 5, 1, 20),
+    quiz_lock_min: clampShow('quiz_lock_min', 30, 1, 1440),
+    notice_stay_sec: clampShow('notice_stay_sec', 5, 1, 120),
     hint_enabled:
       (cfg('hint_enabled', 'true')) === 'true',
     reaction_sync_enabled:
@@ -11251,7 +11621,7 @@ async function handleConfigApi(request, env) {
     userlist_sort:
       cfg('userlist_sort', 'active'),
     userlist_page_size:
-      Number(cfg('userlist_page_size', '20')) || 20
+      clampShow('userlist_page_size', 20, 5, 100)
   });
 }
 
@@ -11396,6 +11766,16 @@ async function handleConfigList(request, env) {
     const keywords = await getBlockKeywords(env);
 
     if (op === 'add') {
+      if (keywords.length >= 200) {
+        return Response.json(
+          {
+            ok: false,
+            error: '屏蔽关键词已达数量上限（200 条）'
+          },
+          { status: 400 }
+        );
+      }
+
       const value = String(body?.value || '').trim();
 
       if (!value) {
@@ -11485,6 +11865,16 @@ async function handleConfigList(request, env) {
       }));
 
     if (op === 'add') {
+      if (rules.length >= 200) {
+        return Response.json(
+          {
+            ok: false,
+            error: '自动回复规则已达数量上限（200 条）'
+          },
+          { status: 400 }
+        );
+      }
+
       const pattern =
         String(body?.pattern || '').trim();
 
@@ -11704,7 +12094,7 @@ async function handleUserListAction(request, env) {
         'sendMessage',
         {
           chat_id: targetId,
-          text: await getConfig(
+          text: await textConfig(
             'verify_success_text',
             env
           )
@@ -12028,6 +12418,7 @@ function buildUserListPage() {
 var qs = new URLSearchParams(location.search);
 var AUTH = { u: qs.get('u'), e: qs.get('e'), s: qs.get('s') };
 var all = [], filt = 'all', query = '', page = 1;
+var listTotal = 0, listTruncated = false;
 var GROUP_C = '';
 var PAGE = 15;
 var LABEL = { verified: '已验证', pending_verification: '待验证', blocked: '已屏蔽' };
@@ -12084,7 +12475,7 @@ function render() {
   var list = visible();
   var pages = Math.max(1, Math.ceil(list.length / PAGE));
   if (page > pages) page = pages;
-  document.getElementById('cnt').textContent = '共 ' + list.length + ' 人';
+  document.getElementById('cnt').textContent = '共 ' + list.length + ' 人' + (listTruncated ? '（仅显示最近活跃的 1000 人，全部共 ' + listTotal + ' 人）' : '');
   document.getElementById('pinfo').textContent = page + ' / ' + pages + ' 页';
   document.getElementById('prev').disabled = page <= 1;
   document.getElementById('next').disabled = page >= pages;
@@ -12403,6 +12794,8 @@ fetch('/api/users?' + qs.toString())
       return;
     }
     all = d.users;
+    listTotal = d.total || 0;
+    listTruncated = !!d.truncated;
     GROUP_C = d.group || '';
     if (d.uiDefaults) {
       if (d.uiDefaults.pageSize) PAGE = d.uiDefaults.pageSize;
@@ -12534,6 +12927,10 @@ async function getPauseState(env) {
       env
     );
 
+    // 先翻牌再清状态：中途被打断时状态还在，下一次读到
+    // 过期状态会续跑剩余记录；通知仍只由抢到的一方发。
+    await flipPauseCards(env);
+
     await dbConfigDelete(PAUSE_STATE_KEY, env);
 
     if (wonNotice) {
@@ -12541,8 +12938,6 @@ async function getPauseState(env) {
         env,
         '⏰ 服务熔断时间已到，机器人已自动恢复服务。'
       );
-
-      await flipPauseCards(env);
     }
 
     return null;
@@ -12577,8 +12972,9 @@ async function stopPause(env) {
 
 // 恢复服务时把每位访客那张「请稍后再试」原地编辑成
 // 已恢复确认。翻牌记录 pausemsg:<uid> = 提示消息编号，
-// 熔断回复发送成功时写入。先删记录再翻牌，单次尽力
-// 而为：牌被访客自行删掉、机器人被拉黑等都静默跳过。
+// 熔断回复发送成功时写入。逐张翻牌后才删对应记录，
+// 中途被打断可由下一次恢复续跑：牌被访客自行删掉、
+// 机器人被拉黑等都静默跳过。
 async function flipPauseCards(env) {
   let rows = [];
 
@@ -12614,9 +13010,9 @@ async function flipPauseCards(env) {
 
     const messageId = Number(row.value);
 
-    await dbConfigDelete(key, env);
-
     if (!userId || !messageId) {
+      await dbConfigDelete(key, env);
+
       continue;
     }
 
@@ -12633,6 +13029,10 @@ async function flipPauseCards(env) {
     } catch {
       /* 翻牌失败不打扰主流程 */
     }
+
+    // 记录在翻牌尝试之后才删：进程中途被打断时，没轮到的
+    // 记录还在，下一次恢复会续跑（已翻的编辑同文案无副作用）。
+    await dbConfigDelete(key, env);
   }
 }
 
@@ -12677,9 +13077,11 @@ async function performPause(env, minutes, byAdminId) {
 }
 
 async function performResume(env, byAdminId) {
-  await stopPause(env);
-
+  // 先翻牌、后清状态：翻牌中途被打断时暂停状态还在，
+  // 管理员再发一次 /resume 即可续跑剩余记录。
   await flipPauseCards(env);
+
+  await stopPause(env);
 
   await notifyPrimaryAdmins(
     env,
@@ -12811,10 +13213,9 @@ async function pauseGateDrops(update, env) {
     );
 
     if (wonReply) {
-      const replyText = await getConfig(
+      const replyText = await textConfig(
         'pause_reply_text',
-        env,
-        '请稍后再试'
+        env
       );
 
       try {

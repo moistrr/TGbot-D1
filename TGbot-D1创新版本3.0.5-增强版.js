@@ -10599,7 +10599,7 @@ fetch('/api/config?' + qs.toString())
     setText('vmode_hint', d.turnstileReady ? '' : '提示：尚未配置 TURNSTILE 密钥，即使选择 Turnstile 也会自动回退为静态问答。');
     setVal('f_ttl', d.verified_ttl_days);
     setVal('f_threshold', d.block_threshold);
-    setVal('f_admins', (d.authorizedAdmins || []).join(', ');
+    setVal('f_admins', (d.authorizedAdmins || []).join(', '));
     setVal('f_pausereply', d.pause_reply_text || '请稍后再试');
     setVal('f_pausereplymode', d.pause_reply_enabled ? 'true' : 'false');
     applyPauseReply();

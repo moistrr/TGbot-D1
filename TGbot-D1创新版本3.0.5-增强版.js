@@ -6,17 +6,27 @@
  * 部署要点
  * - 必填变量：BOT_TOKEN、ADMIN_IDS（逗号分隔，主管理员在前）、
  *   ADMIN_GROUP_ID、WEBHOOK_SECRET；D1 绑定名必须为 TG_BOT_DB。
- * - 可选变量：TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY，缺一即
- *   自动回退静态问答验证，机器人不会因缺密钥不可用。
- * - setWebhook 须带 secret_token，且 allowed_updates 含 message /
+ * - 可选变量：TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY；选了
+ *   Turnstile 又缺密钥时不再自动回退问答（默认答案公开可抄），
+ *   访客会看到未配置提示、管理员会收到告警，须补齐密钥或改选
+ *   静态问答 / 顺序点击（管理员显式选问答不受影响）。
+ * - setWebhook 的 url 须以 /webhook 结尾（根路径不再受理更新），
+ *   且须带 secret_token，allowed_updates 含 message /
  *   edited_message / callback_query / message_reaction /
- *   my_chat_member 五类，缺类对应功能会静默失效。
+ *   my_chat_member / chat_member 六类，缺类对应功能会静默失效
+ *   （缺 chat_member 时管理群成员看门狗不工作）。
  * 安全模型
  * - 出口只有 api.telegram.org、Turnstile siteverify 与 GitHub
  *   Release 检查三处；无硬编码凭据；SQL 全参数化。
  * - 验证链接用 WEBHOOK_SECRET 的 HMAC-SHA256 签名（绑访客、10 分
  *   钟）；网页（指南 / 管理台 / 访客列表）复用 usrlist 签名（绑主
- *   管理员、30 分钟），接口每次复核身份，后两页仅主管理员可用。
+ *   管理员、10 分钟），接口每次复核身份，后两页仅主管理员可用。
+ * - 网页链接签名掺各页 epoch，管理台「安全与审计」可一键让某页
+ *   已发链接全部失效；删除、发证、改配置等敏感操作另带一次性凭
+ *   证（绑管理员、动作与参数），管理操作记审计日志（保留 90 天）。
+ * - Webhook 改同步处理：成功才回 200，失败回 500 由 Telegram
+ *   重推；同一更新连失败 3 次转死信告警；中继复制前先落意向行，
+ *   重推不重复投递。
  * - D1 不存消息正文：只存转发配对（rxmap）、状态与备注；配对类记
  *   录 90 天清理；verified_ttl_days 到期删访客行与话题映射，回来
  *   的人会新建话题；reverify_ttl_days（温和版）到期只把已验证访客
@@ -100,6 +110,7 @@ const DEFAULTS = {
   menu_btn_pause: 'true',
   userlist_sort: 'active',
   userlist_page_size: '20',
+  display_tz: 'Asia/Singapore',
 
   enable_image_forwarding: 'true',
   enable_link_forwarding: 'true',
@@ -297,7 +308,54 @@ function toBoolText(value, defaultValue = true) {
   return value.toLowerCase() === 'true';
 }
 
-function formatTimestamp(timestamp) {
+// 展示时区（资料卡 / 编辑对比通知 / 更新状态行的渲染时区）：
+// 默认 Asia/Singapore，管理台「文案与呈现」可改（config
+// display_tz）。formatTimestamp 是同步函数，时区由 async
+// 调用点先读好再透传进来；这里只做合法性收口——带外写
+// 入的垃圾值一律回退默认，绝不让一个坏时区把渲染打崩。
+// Intl 试建结果按原始值缓存，避免热路径反复试建。
+const DEFAULT_DISPLAY_TZ = 'Asia/Singapore';
+const displayTzCache = new Map();
+
+function resolveDisplayTimeZone(raw) {
+  const value = String(raw || '').trim();
+
+  if (!value) {
+    return DEFAULT_DISPLAY_TZ;
+  }
+
+  if (displayTzCache.has(value)) {
+    return displayTzCache.get(value);
+  }
+
+  let resolved = DEFAULT_DISPLAY_TZ;
+
+  try {
+    new Intl.DateTimeFormat('zh-CN', {
+      timeZone: value
+    });
+
+    resolved = value;
+  } catch (_) {
+    resolved = DEFAULT_DISPLAY_TZ;
+  }
+
+  displayTzCache.set(value, resolved);
+
+  return resolved;
+}
+
+async function getDisplayTimeZone(env) {
+  return resolveDisplayTimeZone(
+    await getConfig(
+      'display_tz',
+      env,
+      DEFAULT_DISPLAY_TZ
+    )
+  );
+}
+
+function formatTimestamp(timestamp, timeZone) {
   if (!timestamp) return '[]';
 
   const date = new Date(Number(timestamp) * 1000);
@@ -307,7 +365,7 @@ function formatTimestamp(timestamp) {
   }
 
   return date.toLocaleString('zh-CN', {
-    timeZone: 'Asia/Shanghai',
+    timeZone: resolveDisplayTimeZone(timeZone),
     hour12: false
   });
 }
@@ -497,6 +555,8 @@ function validateEnvironment(env) {
 // 不能重试——请求可能已被 Telegram 处理、只是响应丢失，
 // 重试会重复投递且重复副本没有配对记录。429 表示请求被拒
 // 未处理，仍可重试；其余方法（编辑/删除/读取等）维持重试。
+// 429 分流：retry_after ≤ 15 秒睡满后重试；更长则抛
+// RateLimitDeferred 交调用方延后处理，不在请求里硬睡。
 const NON_IDEMPOTENT_METHODS = new Set([
   'sendMessage',
   'copyMessage',
@@ -589,22 +649,34 @@ async function telegramApi(
       data.parameters?.retry_after || 0
     );
 
-    if (
-      data.error_code === 429 &&
-      retryAfter > 0 &&
-      attempt < 2
-    ) {
-      await sleep(
-        Math.min(retryAfter * 1000, 10000)
-      );
+    if (data.error_code === 429 && retryAfter > 0) {
+      // retry_after 超过 15 秒不在请求内硬睡：抛可识别的
+      // 限流延迟错误，由调用方按「稍后重来」处理（webhook
+      // 同步路径的接线在后续批次：删占位回 500 延后重推）。
+      if (retryAfter > 15) {
+        const deferred = new Error(
+          `Telegram 限流，需等待 ${retryAfter} 秒` +
+          `（${method}）`
+        );
 
-      return telegramApi(
-        token,
-        method,
-        params,
-        attempt + 1,
-        stats
-      );
+        deferred.name = 'RateLimitDeferred';
+        deferred.retryAfter = retryAfter;
+        deferred.errorCode = 429;
+
+        throw deferred;
+      }
+
+      if (attempt < 2) {
+        await sleep(retryAfter * 1000);
+
+        return telegramApi(
+          token,
+          method,
+          params,
+          attempt + 1,
+          stats
+        );
+      }
     }
 
     if (
@@ -674,6 +746,39 @@ async function ensureUserColumn(
   }
 }
 
+async function ensureProcessedColumn(
+  env,
+  columnName,
+  definition
+) {
+  const result = await env.TG_BOT_DB.prepare(
+    'PRAGMA table_info(processed_updates)'
+  ).all();
+
+  const columns = result?.results || [];
+  const exists = columns.some(
+    (column) => column.name === columnName
+  );
+
+  if (!exists) {
+    try {
+      await env.TG_BOT_DB.prepare(
+        `ALTER TABLE processed_updates ADD COLUMN ` +
+        `${columnName} ${definition}`
+      ).run();
+    } catch (error) {
+      // 多个实例并发迁移时，后到者会撞上「列已存在」，视为成功。
+      if (
+        !String(error?.message || error).includes(
+          'duplicate column'
+        )
+      ) {
+        throw error;
+      }
+    }
+  }
+}
+
 async function dbMigrate(env) {
   if (!env.TG_BOT_DB) {
     throw new Error(
@@ -717,7 +822,19 @@ async function dbMigrate(env) {
     `
     CREATE TABLE IF NOT EXISTS processed_updates (
       update_id TEXT PRIMARY KEY NOT NULL,
-      processed_at INTEGER NOT NULL
+      processed_at INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'done',
+      attempts INTEGER NOT NULL DEFAULT 0
+    )
+    `,
+    `
+    CREATE TABLE IF NOT EXISTS admin_audit (
+      ts INTEGER NOT NULL,
+      admin_id TEXT,
+      action TEXT,
+      target TEXT,
+      result TEXT,
+      detail TEXT
     )
     `,
     `
@@ -737,6 +854,10 @@ async function dbMigrate(env) {
     `
     CREATE INDEX IF NOT EXISTS idx_processed_updates_time
     ON processed_updates(processed_at)
+    `,
+    `
+    CREATE INDEX IF NOT EXISTS idx_admin_audit_ts
+    ON admin_audit(ts)
     `
   ];
 
@@ -792,6 +913,18 @@ async function dbMigrate(env) {
   await ensureUserColumn(
     env,
     'relay_exempt',
+    'INTEGER NOT NULL DEFAULT 0'
+  );
+
+  await ensureProcessedColumn(
+    env,
+    'status',
+    "TEXT NOT NULL DEFAULT 'done'"
+  );
+
+  await ensureProcessedColumn(
+    env,
+    'attempts',
     'INTEGER NOT NULL DEFAULT 0'
   );
 }
@@ -907,7 +1040,10 @@ async function cleanupDatabase(env) {
       () => cleanupExpiredUsers(env, now),
       () => cleanupReverifyExpiredUsers(env, now),
       () => cleanupStaleMenuTracks(env),
-      () => sweepEphemeralNotices(env)
+      () => sweepEphemeralNotices(env),
+      () => cleanupOldAuditRows(env),
+      () => sweepExpiredNonces(env),
+      () => sweepStaleUpdateClaims(env)
     ]) {
       try {
         await sweep();
@@ -924,6 +1060,21 @@ async function cleanupDatabase(env) {
       error?.message || error
     );
   }
+}
+
+// 卡死占位清扫：同步处理模型下，一条更新 10 分钟还没
+// 处理完只可能是进程已死。pending 占位留着会把该更新
+// 的后续投递一直挡在「在途重复」上，这里整行删掉，
+// 之后的全新投递可从零处理（中继有意向行防重复复制）。
+async function sweepStaleUpdateClaims(env) {
+  const cutoff =
+    Math.floor(Date.now() / 1000) -
+    UPDATE_CLAIM_STALE_SECONDS;
+
+  await env.TG_BOT_DB.prepare(
+    'DELETE FROM processed_updates ' +
+    "WHERE status = 'pending' AND processed_at < ?"
+  ).bind(cutoff).run();
 }
 
 // 主菜单追踪（mainmenu:<chatId>）超过保鲜期后，里面的消息号
@@ -1262,25 +1413,121 @@ async function touchUserActivity(user, env) {
   }
 }
 
-async function claimUpdate(updateId, env) {
+// 两阶段 claim（at-least-once）：先占位 pending，处理
+// 成功标 done；失败置 failed 释放占位并累计 attempts——
+// 未满 3 次等 Telegram 重推后立即重办，满 3 次标 done
+// 判死信（见 processWebhookUpdate）。失败不删行：删行会
+// 把 attempts 一并清零，死信计数永远到不了 3。重推撞见
+// 10 分钟内的 pending 视为在途重复；更久的 pending 视为
+// 上次进程已死，接管重办（attempts 沿用）；failed 不论
+// 新旧一律立即重办。存量行（旧版只有时间戳）迁移后
+// status 默认 'done'，与旧「占过即已处理」语义一致。
+const UPDATE_CLAIM_STALE_SECONDS = 600;
+
+async function claimUpdateStart(updateId, env) {
   if (
     updateId === null ||
     updateId === undefined
   ) {
+    return { mode: 'skip', attempts: 0 };
+  }
+
+  const id = String(updateId);
+  const now = Math.floor(Date.now() / 1000);
+
+  const existing = await env.TG_BOT_DB.prepare(
+    'SELECT status, attempts, processed_at ' +
+    'FROM processed_updates WHERE update_id = ?'
+  ).bind(id).first();
+
+  if (!existing) {
+    const inserted = await env.TG_BOT_DB.prepare(`
+      INSERT OR IGNORE INTO processed_updates (
+        update_id,
+        processed_at,
+        status,
+        attempts
+      ) VALUES (?, ?, 'pending', 0)
+    `).bind(id, now).run();
+
+    if (Number(inserted?.meta?.changes || 0) > 0) {
+      return { mode: 'process', attempts: 0 };
+    }
+
+    // 并发下被别的实例抢先占位：按在途重复处理。
+    return { mode: 'inflight', attempts: 0 };
+  }
+
+  const attempts = Number(existing.attempts || 0);
+
+  if (existing.status === 'done') {
+    return { mode: 'duplicate', attempts };
+  }
+
+  if (existing.status === 'failed') {
+    await env.TG_BOT_DB.prepare(
+      "UPDATE processed_updates SET status = 'pending', " +
+      'processed_at = ? WHERE update_id = ?'
+    ).bind(now, id).run();
+
+    return { mode: 'process', attempts };
+  }
+
+  if (
+    now - Number(existing.processed_at || 0) <=
+    UPDATE_CLAIM_STALE_SECONDS
+  ) {
+    return { mode: 'inflight', attempts };
+  }
+
+  // 接管：刷新占位时间，attempts 沿用。
+  await env.TG_BOT_DB.prepare(
+    'UPDATE processed_updates SET processed_at = ? ' +
+    'WHERE update_id = ?'
+  ).bind(now, id).run();
+
+  return { mode: 'process', attempts };
+}
+
+async function claimUpdateDone(updateId, env) {
+  if (
+    updateId === null ||
+    updateId === undefined
+  ) {
+    return;
+  }
+
+  await env.TG_BOT_DB.prepare(
+    "UPDATE processed_updates SET status = 'done' " +
+    'WHERE update_id = ?'
+  ).bind(String(updateId)).run();
+}
+
+// 返回 true 表示 attempts 已达 3 次、行已标 done 判死信；
+// false 表示行已置 failed 释放占位，等重推立即重办。
+async function claimUpdateFailed(
+  updateId,
+  env,
+  prevAttempts
+) {
+  const id = String(updateId);
+  const attempts = Number(prevAttempts || 0) + 1;
+
+  if (attempts >= 3) {
+    await env.TG_BOT_DB.prepare(
+      "UPDATE processed_updates SET status = 'done', " +
+      'attempts = ? WHERE update_id = ?'
+    ).bind(attempts, id).run();
+
     return true;
   }
 
-  const result = await env.TG_BOT_DB.prepare(`
-    INSERT OR IGNORE INTO processed_updates (
-      update_id,
-      processed_at
-    ) VALUES (?, ?)
-  `).bind(
-    String(updateId),
-    Math.floor(Date.now() / 1000)
-  ).run();
+  await env.TG_BOT_DB.prepare(
+    "UPDATE processed_updates SET status = 'failed', " +
+    'attempts = ? WHERE update_id = ?'
+  ).bind(attempts, id).run();
 
-  return Number(result?.meta?.changes || 0) > 0;
+  return false;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2061,7 +2308,8 @@ function buildUserInfoPayload(
   from,
   firstMessageDate = null,
   adminNote = '',
-  titleStyle = 'note_first'
+  titleStyle = 'note_first',
+  displayTz = DEFAULT_DISPLAY_TZ
 ) {
   const userId = String(from.id);
   const firstName = from.first_name || '';
@@ -2138,7 +2386,7 @@ function buildUserInfoPayload(
   const firstTimeText = firstMessageDate
     ? `<b>首次消息时间:</b> ` +
       `<code>${escapeHtml(
-        formatTimestamp(firstMessageDate)
+        formatTimestamp(firstMessageDate, displayTz)
       )}</code>`
     : '';
 
@@ -2332,7 +2580,8 @@ async function refreshUserInfoCard(
     from,
     firstMessageDate,
     user.admin_note || '',
-    await getConfig('topic_title_style', env, 'note_first')
+    await getConfig('topic_title_style', env, 'note_first'),
+    await getDisplayTimeZone(env)
   );
 
   // 话题名先行同步：改名不依赖资料卡编辑的结果——
@@ -2439,7 +2688,8 @@ async function refreshCardAfterNoteChange(
           'topic_title_style',
           env,
           'note_first'
-        )
+        ),
+        await getDisplayTimeZone(env)
       );
 
       await renameForumTopic(
@@ -2481,7 +2731,8 @@ async function createInfoCard(
     message.from,
     message.date,
     user.admin_note || '',
-    await getConfig('topic_title_style', env, 'note_first')
+    await getConfig('topic_title_style', env, 'note_first'),
+    await getDisplayTimeZone(env)
   );
 
   const sent = await telegramApi(
@@ -2831,7 +3082,8 @@ if (user.topic_id) {
       message.from,
       message.date,
       '',
-      await getConfig('topic_title_style', env, 'note_first')
+      await getConfig('topic_title_style', env, 'note_first'),
+      await getDisplayTimeZone(env)
     );
 
     const topic = await telegramApi(
@@ -3047,12 +3299,202 @@ async function copyMessageWithReplyFallback(
   }
 }
 
+// 特殊消息类型名映射（集中定义）：这些类型机器人没有
+// 专门处理，本体复制失败时改在话题里落占位卡。
+const SPECIAL_MESSAGE_TYPE_NAMES = [
+  ['poll', '投票'],
+  ['location', '位置'],
+  ['venue', '地点'],
+  ['game', '游戏'],
+  ['invoice', '发票'],
+  ['contact', '联系人名片'],
+  ['dice', '骰子动画']
+];
+
+// 命中返回类型名：先看源消息类型字段，再看失败错误是
+// 否指向受保护内容（来源聊天禁止转发 / 保存）。普通类
+// 型的一般失败不在此列，仍走原转发失败提醒。
+function unsupportedTypeName(message, error) {
+  for (const [
+    field,
+    name
+  ] of SPECIAL_MESSAGE_TYPE_NAMES) {
+    if (message?.[field]) {
+      return name;
+    }
+  }
+
+  const text = String(
+    error?.message || error || ''
+  ).toLowerCase();
+
+  if (
+    text.includes('protected') ||
+    text.includes('forwards_restricted') ||
+    text.includes('forwards restricted')
+  ) {
+    return '受保护内容';
+  }
+
+  return null;
+}
+
+const UNSUPPORTED_NOTICE_MIN_MS = 10 * 60 * 1000;
+
+// 无法转达时给访客一句交代，免得访客以为已送达、管理员
+// 那边却只有占位卡：10 分钟节流，独立键 unsupported:
+// <uid>，与转发失败提醒的 copyfail: 节流互不影响。
+async function notifyVisitorUnsupported(message, env) {
+  try {
+    const userId = String(message.from.id);
+    const throttleKey = `unsupported:${userId}`;
+    const last = Number(
+      (await dbConfigGet(throttleKey, env)) || 0
+    );
+
+    if (
+      Date.now() - last <
+      UNSUPPORTED_NOTICE_MIN_MS
+    ) {
+      return;
+    }
+
+    await dbConfigPut(
+      throttleKey,
+      String(Date.now()),
+      env
+    );
+
+    await telegramApi(env.BOT_TOKEN, 'sendMessage', {
+      chat_id: message.chat.id,
+      text: '这类消息机器人暂时无法转达，已提醒管理员。'
+    });
+  } catch (_) {
+    /* 提示失败不影响主流程 */
+  }
+}
+
+// 本体复制失败且属于特殊类型 / 受保护内容时，在话题里
+// 落一张占位卡代替原失败提醒：管理员至少知道访客发来
+// 过什么，回复占位卡照样能把话带回访客私聊。
+// 与意向行的衔接：复制前落的 p: 行此刻仍是 'intent'，
+// 这里用占位卡编号走同一条 fillRelayPair 回填（源行先
+// 行），不留 'intent' 残行；回填失败照样抛
+// PairPersistError 走重推，重推时 p: 已是数字、按已送
+// 达收尾，不会重复落卡。占位卡自身的发送失败则返回
+// false，调用方按原路抛错、走原转发失败提醒兜底。
+async function relayUnsupportedPlaceholder(
+  message,
+  user,
+  topicId,
+  env,
+  error
+) {
+  const typeName = unsupportedTypeName(message, error);
+
+  if (!typeName) {
+    return false;
+  }
+
+  const userId = String(message.from.id);
+
+  let sent = null;
+
+  try {
+    sent = await telegramApi(env.BOT_TOKEN, 'sendMessage', {
+      chat_id: env.ADMIN_GROUP_ID,
+      message_thread_id: Number(topicId),
+      text:
+        `📩 访客发来一条『${typeName}』，` +
+        '机器人无法转发本体。',
+      disable_notification: Boolean(
+        user.is_blocked || user.is_muted
+      )
+    });
+  } catch (sendError) {
+    console.error(
+      '发送特殊类型占位卡失败：',
+      sendError?.message || sendError
+    );
+
+    return false;
+  }
+
+  if (!sent?.message_id) {
+    return false;
+  }
+
+  await fillRelayPair(
+    userId,
+    message.message_id,
+    sent.message_id,
+    'p',
+    env
+  );
+
+  // 与正常送达一致的收尾：消息已（以占位卡形式）送达
+  // 话题，成功回执使命完成，顺手撤回。
+  await clearSlotMessage(
+    env,
+    userId,
+    'receipt_msg_id'
+  );
+
+  await notifyVisitorUnsupported(message, env);
+
+  return true;
+}
+
 async function relayUserMessageToTopic(
   message,
   user,
   env
 ) {
   const userId = String(message.from.id);
+
+  // 幂等意向行（源消息键 p:<uid>:<私聊消息id>）：更新
+  // 重推时先看这一行——已墓碑（管理员 /delete 删过话题
+  // 副本）静默收尾，绝不让被删内容借重推复活；已回填
+  // 数字说明上次复制已达话题，只补配对与回执收尾、
+  // 不再复制；'intent' 或无行才走下面的复制流程（复制
+  // 前先落 'intent'，崩在复制当口时重推按未复制重走，
+  // 残余重复窗口只剩「复制已达 Telegram 但回执未回」
+  // 的网络含糊区）。
+  const pairKey = `p:${userId}:${message.message_id}`;
+  const existingPair = await readRelayPair(pairKey, env);
+
+  if (existingPair?.text === 'gone') {
+    return;
+  }
+
+  if (/^\d+$/.test(String(existingPair?.text || ''))) {
+    await fillRelayPair(
+      userId,
+      message.message_id,
+      Number(existingPair.text),
+      'p',
+      env
+    );
+
+    // 与正常路径一致的收尾：首条消息已送达话题，
+    // 成功回执使命完成，顺手撤回。
+    await clearSlotMessage(
+      env,
+      userId,
+      'receipt_msg_id'
+    );
+
+    return;
+  }
+
+  if (!existingPair) {
+    await writeRelayPairRow(
+      pairKey,
+      'intent',
+      Math.floor(Date.now() / 1000),
+      env
+    );
+  }
 
   // 获取最新访客状态，防止并发请求使用过期数据。
   let freshUser = await dbUserGetOrCreate(
@@ -3151,29 +3593,61 @@ async function relayUserMessageToTopic(
         }
       );
 
-      const reopenRetry =
-        await copyMessageWithReplyFallback(
-          env.BOT_TOKEN,
-          {
-            chat_id: env.ADMIN_GROUP_ID,
-            message_thread_id:
-              Number(topicId),
-            from_chat_id:
-              String(message.chat.id),
-            message_id:
-              message.message_id,
-            disable_notification:
-              Boolean(
-                freshUser.is_blocked ||
-                freshUser.is_muted
-              )
-          },
-          replyParameters
-        );
+      let reopenRetry = null;
+
+      try {
+        reopenRetry =
+          await copyMessageWithReplyFallback(
+            env.BOT_TOKEN,
+            {
+              chat_id: env.ADMIN_GROUP_ID,
+              message_thread_id:
+                Number(topicId),
+              from_chat_id:
+                String(message.chat.id),
+              message_id:
+                message.message_id,
+              disable_notification:
+                Boolean(
+                  freshUser.is_blocked ||
+                  freshUser.is_muted
+                )
+            },
+            replyParameters
+          );
+      } catch (retryError) {
+        if (
+          await relayUnsupportedPlaceholder(
+            message,
+            freshUser,
+            topicId,
+            env,
+            retryError
+          )
+        ) {
+          return;
+        }
+
+        throw retryError;
+      }
 
       copiedMessageId =
         reopenRetry?.message_id || null;
     } else if (!isTopicInvalidError(error)) {
+      // 特殊类型 / 受保护内容：落占位卡收尾，不上抛、
+      // 不走原转发失败提醒。
+      if (
+        await relayUnsupportedPlaceholder(
+          message,
+          freshUser,
+          topicId,
+          env,
+          error
+        )
+      ) {
+        return;
+      }
+
       throw error;
     } else {
       console.error(
@@ -3220,25 +3694,43 @@ async function relayUserMessageToTopic(
         );
       }
 
-      const retryCopyResult =
-        await copyMessageWithReplyFallback(
-        env.BOT_TOKEN,
-        {
-          chat_id: env.ADMIN_GROUP_ID,
-          message_thread_id:
-            Number(newTopicId),
-          from_chat_id:
-            String(message.chat.id),
-          message_id:
-            message.message_id,
-          disable_notification:
-            Boolean(
-              newestUser.is_blocked ||
-              newestUser.is_muted
-            )
-        },
-        replyParameters
-      );
+      let retryCopyResult = null;
+
+      try {
+        retryCopyResult =
+          await copyMessageWithReplyFallback(
+          env.BOT_TOKEN,
+          {
+            chat_id: env.ADMIN_GROUP_ID,
+            message_thread_id:
+              Number(newTopicId),
+            from_chat_id:
+              String(message.chat.id),
+            message_id:
+              message.message_id,
+            disable_notification:
+              Boolean(
+                newestUser.is_blocked ||
+                newestUser.is_muted
+              )
+          },
+          replyParameters
+        );
+      } catch (retryError) {
+        if (
+          await relayUnsupportedPlaceholder(
+            message,
+            newestUser,
+            newTopicId,
+            env,
+            retryError
+          )
+        ) {
+          return;
+        }
+
+        throw retryError;
+      }
 
       copiedMessageId =
         retryCopyResult?.message_id ||
@@ -3249,10 +3741,11 @@ async function relayUserMessageToTopic(
   }
 
   if (copiedMessageId) {
-    await storeMessagePair(
+    await fillRelayPair(
       userId,
       message.message_id,
       copiedMessageId,
+      'p',
       env
     );
   }
@@ -3273,6 +3766,48 @@ async function relayAdminMessageToUser(
   userId,
   env
 ) {
+  // 幂等意向行（源消息键 t:<话题消息id>）：更新重推时
+  // 先看这一行——已墓碑（该话题消息已被 /delete 处理）
+  // 静默收尾；已回填 <uid>:<私聊消息id> 说明上次复制
+  // 已达访客私聊，只补配对、不再复制；'intent' 或无行
+  // 才走下面的复制流程（复制前先落 'intent'）。
+  const pairKey = `t:${message.message_id}`;
+  const existingPair = await readRelayPair(pairKey, env);
+
+  if (existingPair?.text === 'gone') {
+    return null;
+  }
+
+  const existingMatch = String(
+    existingPair?.text || ''
+  ).match(/^(\d+):(\d+)$/);
+
+  if (
+    existingMatch &&
+    existingMatch[1] === String(userId)
+  ) {
+    await fillRelayPair(
+      userId,
+      Number(existingMatch[2]),
+      message.message_id,
+      't',
+      env
+    );
+
+    return {
+      message_id: Number(existingMatch[2])
+    };
+  }
+
+  if (!existingPair) {
+    await writeRelayPairRow(
+      pairKey,
+      'intent',
+      Math.floor(Date.now() / 1000),
+      env
+    );
+  }
+
   // 若管理员引用了话题里的某条消息，把引用换算到访客
   // 私聊侧的原始消息 ID（配对不存在或已墓碑时不带引用）。
   let replyParameters = null;
@@ -3319,10 +3854,11 @@ async function relayAdminMessageToUser(
     );
 
   if (copyResult?.message_id) {
-    await storeMessagePair(
+    await fillRelayPair(
       userId,
       copyResult.message_id,
       message.message_id,
+      't',
       env
     );
   }
@@ -3339,44 +3875,78 @@ const REACTION_MAP_USER = 'rxmap';
 const EDIT_HINT_TEXT = '✍🏼已编辑';
 const EDIT_HINT_BUTTON_TEXT = '系统提示';
 
-async function storeMessagePair(
+// 配对持久化失败标记：复制已成功但配对没落库（或复制前
+// 读/写意向行失败）时抛出。两个中继调用方不得把它按
+// 「转发失败」吞掉——必须让整条更新走失败重推，靠意向
+// 行在重推时补齐配对、跳过复制，避免对侧出现两份副本。
+function pairPersistError(cause) {
+  const error = new Error(
+    '保存消息配对失败：' +
+    (cause?.message || cause || '')
+  );
+
+  error.name = 'PairPersistError';
+
+  return error;
+}
+
+async function readRelayPair(pairKey, env) {
+  try {
+    return await dbMessageDataGet(
+      REACTION_MAP_USER,
+      pairKey,
+      env
+    );
+  } catch (error) {
+    throw pairPersistError(error);
+  }
+}
+
+async function writeRelayPairRow(
+  pairKey,
+  value,
+  date,
+  env
+) {
+  try {
+    await dbMessageDataPut(
+      REACTION_MAP_USER,
+      pairKey,
+      { text: String(value), date },
+      env
+    );
+  } catch (error) {
+    throw pairPersistError(error);
+  }
+}
+
+// 复制成功后的配对回填：先写源方向一行（重推时靠它判定
+// 已复制、跳过复制），再补反方向一行。两行都是幂等
+// upsert，重推时整段重跑即可补齐缺行；任一写失败抛
+// PairPersistError 让整条更新走失败重推。sourceKey 是
+// 源消息所在侧的键前缀：访客→话题为 'p'，话题→访客
+// 为 't'。
+async function fillRelayPair(
   userId,
   privateMessageId,
   topicMessageId,
+  sourceKey,
   env
 ) {
   const now =
     Math.floor(Date.now() / 1000);
 
-  try {
-    // 两个方向的配对一次 batch 写入，避免半对儿。
-    await env.TG_BOT_DB.batch([
-      messageDataPutStatement(
-        REACTION_MAP_USER,
-        `p:${userId}:${privateMessageId}`,
-        {
-          text: String(topicMessageId),
-          date: now
-        },
-        env
-      ),
+  const pKey = `p:${userId}:${privateMessageId}`;
+  const tKey = `t:${topicMessageId}`;
+  const pValue = String(topicMessageId);
+  const tValue = `${userId}:${privateMessageId}`;
 
-      messageDataPutStatement(
-        REACTION_MAP_USER,
-        `t:${topicMessageId}`,
-        {
-          text:
-            `${userId}:${privateMessageId}`,
-          date: now
-        },
-        env
-      )
-    ]);
-  } catch (error) {
-    console.error(
-      '保存消息配对失败：',
-      error?.message || error
-    );
+  if (sourceKey === 't') {
+    await writeRelayPairRow(tKey, tValue, now, env);
+    await writeRelayPairRow(pKey, pValue, now, env);
+  } else {
+    await writeRelayPairRow(pKey, pValue, now, env);
+    await writeRelayPairRow(tKey, tValue, now, env);
   }
 }
 
@@ -3555,8 +4125,8 @@ async function tombstoneTopicMessage(
           privateMessageId
         };
 
-        // 两行墓碑一次 batch 写完（与 storeMessagePair
-        // 同一口径）：分开写时第二写失败会留下半边墓碑，
+        // 两行墓碑一次 batch 写完：分开写时第二写失败
+        // 会留下半边墓碑，
         // 已删消息的编辑会走回退路径借通知「复活」。
         await env.TG_BOT_DB.batch([
           messageDataPutStatement(
@@ -4133,7 +4703,10 @@ async function showMainMenu(
     await readUpdateCache(env);
 
   const updateState =
-    describeUpdateState(updateCache);
+    describeUpdateState(
+      updateCache,
+      await getDisplayTimeZone(env)
+    );
 
   const versionLine =
     updateState.status === 'update' &&
@@ -4257,7 +4830,7 @@ ${versionLine}${pauseLine}
   // 主菜单只保留最新一对：删除推迟一轮——新发菜单送达后，
   // 删掉的是上一条主菜单与触发它的那条 /start（或 /help）命令消息，
   // 最新的一条命令消息始终留在聊天里，点一下就能重发刷新菜单
-  // （网页链接 30 分钟过期，靠它快速拿新链接）；原地编辑形态只更新追踪。
+  // （网页链接 10 分钟过期，靠它快速拿新链接）；原地编辑形态只更新追踪。
   try {
     if (menuMessageId) {
       const trackKey = `mainmenu:${chatId}`;
@@ -4382,6 +4955,11 @@ async function handleStart(
       chatId,
       env,
       origin
+    );
+  } else if (mode === 'unconfigured') {
+    await sendVerifyUnconfiguredPrompt(
+      chatId,
+      env
     );
   } else if (mode === 'sequence') {
     await sendSequencePrompt(
@@ -5445,8 +6023,85 @@ async function getEffectiveVerifyMode(env) {
     return 'turnstile';
   }
 
-  // turnstile 未配密钥时仍回退静态问答（原有口径不变）。
-  return 'quiz';
+  // turnstile 未配密钥不再回退静态问答：默认问答的答案
+  // 公开可抄，静默降级等于没有验证。返回 unconfigured，
+  // 由消费点 fail-closed（访客看未配置提示、管理员收告警）；
+  // 管理员显式选的 quiz 在上面已原样返回，不受影响。
+  return 'unconfigured';
+}
+
+const VERIFY_UNCONFIGURED_TEXT =
+  '⚠️ 验证服务尚未配置完成，请联系管理员。';
+
+// 验证未配置告警：私聊全体主管理员，config 时间戳节流
+// 每天至多一条（读-改-写非原子，并发下偶尔多发一条可接受）。
+async function alertAdminsVerifyUnconfigured(env) {
+  try {
+    const last = Number(
+      (await dbConfigGet(
+        'alertat:unconfigured',
+        env
+      )) || 0
+    );
+
+    if (Date.now() - last < 24 * 60 * 60 * 1000) {
+      return;
+    }
+
+    await dbConfigPut(
+      'alertat:unconfigured',
+      String(Date.now()),
+      env
+    );
+
+    for (const adminId of getPrimaryAdminIds(env)) {
+      await telegramApi(env.BOT_TOKEN, 'sendMessage', {
+        chat_id: adminId,
+        text:
+          '⚠️ 验证服务未配置：当前验证方式选的是 ' +
+          'Turnstile，但 TURNSTILE 密钥未配齐，' +
+          '访客暂时无法完成验证。请补齐密钥，' +
+          '或在网页管理台把验证方式改成静态问答 / 顺序点击。'
+      });
+    }
+  } catch (error) {
+    console.error(
+      '发送验证未配置告警失败：',
+      error?.message || error
+    );
+  }
+}
+
+// 访客侧未配置提示：先触发管理员告警（自带每日节流），
+// 再按验证提示的槽位与 3 分钟节流发提示——验证通过后
+// 这条提示由 cleanupAfterVerified 随槽位一并撤回。
+async function sendVerifyUnconfiguredPrompt(
+  chatId,
+  env
+) {
+  await alertAdminsVerifyUnconfigured(env);
+
+  if (await promptThrottled(env, chatId)) {
+    return;
+  }
+
+  const sent = await telegramApi(
+    env.BOT_TOKEN,
+    'sendMessage',
+    {
+      chat_id: chatId,
+      text: VERIFY_UNCONFIGURED_TEXT
+    }
+  );
+
+  await trackSlotMessage(
+    env,
+    chatId,
+    'verify_prompt_msg_id',
+    sent?.message_id
+  );
+
+  await markPromptSent(env, chatId);
 }
 
 function getPublicOrigin(requestOrigin, env) {
@@ -5947,15 +6602,14 @@ async function telegramInitDataUserId(initDataRaw, botToken) {
     const authDate = Number(params.get('auth_date') || 0);
     const nowSec = Math.floor(Date.now() / 1000);
 
-    // 新鲜窗 24 小时：auth_date 在 Mini App 打开瞬间
-    // 定格，而验证链接最长 120 分钟、通行证最长 1440
-    // 分钟——1 小时窗会把「开着页面慢慢来」的合法访客
-    // 误拒。安全性由链接自身的签名 exp、通行证记录的
-    // nonce/exp 共同把关，这里只防陈旧 initData 重放。
+    // 新鲜窗 1 小时（原 24 小时，按安全复核收紧）：auth_date
+    // 在 Mini App 打开瞬间定格，开着页面超过 1 小时才确认
+    // 的合法访客会被误拒、需要重开页面——窗口取舍已确认。
+    // 链接自身的签名 exp、通行证记录的 nonce/exp 仍共同把关。
     if (
       !authDate ||
       authDate > nowSec + 300 ||
-      nowSec - authDate > 86400
+      nowSec - authDate > 3600
     ) {
       return null;
     }
@@ -6057,18 +6711,17 @@ async function sendTurnstilePrompt(
   );
 
   if (!base) {
-    // 无法确定验证页地址时回退静态问题，避免访客卡死。
-    const question = await getConfig(
-      'verif_q',
-      env
-    );
+    // 无法确定验证页地址：fail-closed，不再回退静态问题
+    // （回退问答等于把验证降级成公开答案）。发未配置提示
+    // 并告警管理员；本函数入口已查过提示节流。
+    await alertAdminsVerifyUnconfigured(env);
 
     const promptSent = await telegramApi(
       env.BOT_TOKEN,
       'sendMessage',
       {
         chat_id: chatId,
-        text: question
+        text: VERIFY_UNCONFIGURED_TEXT
       }
     );
 
@@ -6732,18 +7385,34 @@ async function handleVerifyConfirm(
     });
   }
 
-  const expectedHost =
-    new URL(request.url).hostname;
+  // hostname 改 fail-closed：siteverify 没回 hostname
+  // 直接拒（原先「有值才比对」等于给缺字段留后门）。
+  // 比对对象是允许列表：PUBLIC_URL 的域名（配了才有）
+  // 与本次请求的域名，多域名部署两边都认。
+  const allowedHosts = new Set([
+    new URL(request.url).hostname
+  ]);
+
+  const configuredOrigin = String(
+    env.PUBLIC_URL || ''
+  ).trim();
+
+  if (configuredOrigin) {
+    try {
+      allowedHosts.add(
+        new URL(configuredOrigin).hostname
+      );
+    } catch {}
+  }
 
   if (
-    verifyResult.hostname &&
-    verifyResult.hostname !==
-      expectedHost
+    !verifyResult.hostname ||
+    !allowedHosts.has(verifyResult.hostname)
   ) {
     console.warn(
       'Turnstile hostname 不匹配：',
       verifyResult.hostname,
-      expectedHost
+      [...allowedHosts].join(',')
     );
 
     return jsonResponse(403, {
@@ -7189,7 +7858,8 @@ async function notifyRelayRateLimited(user, env) {
 async function handlePrivateMessage(
   message,
   env,
-  origin = ''
+  origin = '',
+  ctx = null
 ) {
   if (!message?.chat?.id) return;
 
@@ -7382,7 +8052,10 @@ async function handlePrivateMessage(
       );
 
       const described =
-        describeUpdateState(state);
+        describeUpdateState(
+          state,
+          await getDisplayTimeZone(env)
+        );
 
       await telegramApi(
         env.BOT_TOKEN,
@@ -7420,7 +8093,7 @@ async function handlePrivateMessage(
         'sendMessage',
         {
           chat_id: chatId,
-          text: '🛠 网页管理台（链接 30 分钟内有效，过期重新发送 /panel）',
+          text: '🛠 网页管理台（链接 10 分钟内有效，过期重新发送 /panel）',
           reply_markup: {
             inline_keyboard: [
               [
@@ -7459,7 +8132,7 @@ async function handlePrivateMessage(
             }
           );
         } else {
-          await performResume(env, userId);
+          await performResume(env, userId, ctx);
 
           await telegramApi(
             env.BOT_TOKEN,
@@ -7623,6 +8296,17 @@ async function handlePrivateMessage(
         chatId,
         env,
         origin
+      );
+
+      return;
+    }
+
+    if (mode === 'unconfigured') {
+      // 验证未配置：不把访客文字当问答答案处理，
+      // 回未配置提示（内含管理员告警与节流）。
+      await sendVerifyUnconfiguredPrompt(
+        chatId,
+        env
       );
 
       return;
@@ -7800,7 +8484,7 @@ async function handlePrivateMessage(
         env,
         30,
         1,
-        1000
+        100
       );
 
       relayRefill = await clampedIntConfig(
@@ -7808,7 +8492,7 @@ async function handlePrivateMessage(
         env,
         5,
         1,
-        100
+        20
       );
     } catch (error) {
       console.error(
@@ -7837,6 +8521,16 @@ async function handlePrivateMessage(
       env
     );
   } catch (error) {
+    // 两类错误必须上抛走失败重推，不能按「转发失败」
+    // 吞掉：限流延迟（稍后重推即可送达）与配对落库
+    // 失败（复制其实已成功，重推靠意向行补配对）。
+    if (
+      error?.name === 'RateLimitDeferred' ||
+      error?.name === 'PairPersistError'
+    ) {
+      throw error;
+    }
+
     console.error(
       '转发访客消息失败：',
       error?.message || error
@@ -8094,7 +8788,7 @@ async function handleAdminCommand(
           ctx
         );
       } else {
-        await performResume(env, senderId);
+        await performResume(env, senderId, ctx);
 
         await sendEphemeralTopicNotice(
           message,
@@ -8922,6 +9616,15 @@ const topicId =
       env
     );
   } catch (error) {
+    // 与访客侧同口径：限流延迟与配对落库失败上抛走
+    // 失败重推（复制可能已成功，勿发误导的失败提示）。
+    if (
+      error?.name === 'RateLimitDeferred' ||
+      error?.name === 'PairPersistError'
+    ) {
+      throw error;
+    }
+
     console.error(
       '管理员消息转发失败：',
       error?.message || error
@@ -9081,8 +9784,10 @@ async function handleRelayEditedMessage(
     stored?.text ||
     '[原始内容无法获取或不是文本内容]';
 
+  const displayTz = await getDisplayTimeZone(env);
+
   const originalDate = stored?.date
-    ? formatTimestamp(stored.date)
+    ? formatTimestamp(stored.date, displayTz)
     : '[发送时间无法获取]';
 
   const newContent =
@@ -9252,13 +9957,16 @@ async function handleAdminEditedReply(
     editedMessage.caption ||
     '[媒体内容]';
 
+  const displayTz = await getDisplayTimeZone(env);
+
   const originalTime =
-    formatTimestamp(stored.date);
+    formatTimestamp(stored.date, displayTz);
 
   const editTime =
     formatTimestamp(
       editedMessage.edit_date ||
-      editedMessage.date
+      editedMessage.date,
+      displayTz
     );
 
   const notificationText = `
@@ -9729,7 +10437,8 @@ async function handleUserCardCallback(
 async function handleCallbackQuery(
   callbackQuery,
   env,
-  origin = ''
+  origin = '',
+  ctx = null
 ) {
   if (!callbackQuery?.from?.id) {
     return;
@@ -9810,7 +10519,8 @@ async function handleCallbackQuery(
     await handlePauseCallback(
       callbackQuery,
       env,
-      origin
+      origin,
+      ctx
     );
 
     return;
@@ -9819,7 +10529,8 @@ async function handleCallbackQuery(
   if (data.startsWith('clear:')) {
     await handleClearCallback(
       callbackQuery,
-      env
+      env,
+      ctx
     );
 
     return;
@@ -10055,6 +10766,167 @@ async function handleMyChatMember(
   ) {
     await noteBotUnblocked(userId, env);
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                       管理群成员看门狗（chat_member）                       */
+/* -------------------------------------------------------------------------- */
+
+// chat_member 的「在群」判定：restricted 还要看 is_member
+// （被限制但仍留在群里才算在群）。
+function chatMemberInGroup(member) {
+  if (!member) {
+    return false;
+  }
+
+  if (
+    member.status === 'member' ||
+    member.status === 'administrator' ||
+    member.status === 'creator'
+  ) {
+    return true;
+  }
+
+  return (
+    member.status === 'restricted' &&
+    Boolean(member.is_member)
+  );
+}
+
+function describeChatMemberUser(user) {
+  const fullName = [
+    user?.first_name,
+    user?.last_name
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+
+  const username = user?.username
+    ? `（@${escapeHtml(user.username)}）`
+    : '';
+
+  return (
+    `<b>${escapeHtml(fullName || '未知')}</b>` +
+    `${username}，ID：` +
+    `<code>${escapeHtml(String(user?.id || ''))}</code>`
+  );
+}
+
+// 名单外账号「进入」管理群时，私聊告警全体主管理员。
+// 访客的全部对话都在话题里、群成员都能看，代码拦不住
+// 阅读、只能事后发现；预防靠群设置（新成员不可见历
+// 史、仅管理员拉人，见内置指南「管理群成员纪律」）。
+// 白名单 = 机器人自身（BOT_TOKEN 前缀即其 ID）+ 主管理
+// 员（ADMIN_IDS）+ 协管员（authorized_admins）。
+// 去重双保险：只认「不在群 → 在群」的跃迁，且首次告警
+// 用 dbConfigClaim 原子占下 memberalert:<uid> 标记；
+// 对方离群时清标记，再进群可再告警。
+async function handleGroupChatMember(chatMember, env) {
+  if (
+    !chatMember ||
+    String(chatMember.chat?.id) !==
+      String(env.ADMIN_GROUP_ID)
+  ) {
+    return;
+  }
+
+  const newMember = chatMember.new_chat_member;
+  const target = newMember?.user;
+  const targetId =
+    target?.id != null ? String(target.id) : '';
+
+  if (!targetId) {
+    return;
+  }
+
+  const flagKey = `memberalert:${targetId}`;
+
+  if (!chatMemberInGroup(newMember)) {
+    // 离群 / 被踢出：清告警标记，下次再进群重新告警。
+    if (
+      newMember?.status === 'left' ||
+      newMember?.status === 'kicked'
+    ) {
+      await dbConfigDelete(flagKey, env);
+    }
+
+    return;
+  }
+
+  // 已在群内的变更（升降职、限制调整、资料变更重推）
+  // 不是「进入」，不告警。
+  if (
+    chatMemberInGroup(chatMember.old_chat_member)
+  ) {
+    return;
+  }
+
+  const botId = String(env.BOT_TOKEN || '').split(':')[0];
+
+  if (targetId === botId) {
+    return;
+  }
+
+  if (await isAdminUser(targetId, env)) {
+    return;
+  }
+
+  const claimed = await dbConfigClaim(
+    flagKey,
+    '1',
+    env
+  );
+
+  if (!claimed) {
+    return;
+  }
+
+  const lines = [
+    '⚠️ <b>管理群成员告警</b>',
+    '',
+    '名单外账号已进入管理群：' +
+      describeChatMemberUser(target)
+  ];
+
+  if (target?.is_bot) {
+    lines.push('⚠️ 对方是<b>机器人账号</b>。');
+  }
+
+  const actor = chatMember.from;
+
+  if (chatMember.invite_link) {
+    const linkLabel =
+      chatMember.invite_link.name ||
+      chatMember.invite_link.invite_link ||
+      '';
+
+    lines.push(
+      '加入方式：邀请链接' +
+        (linkLabel
+          ? `「${escapeHtml(
+              String(linkLabel).slice(0, 60)
+            )}」`
+          : '')
+    );
+  } else if (
+    actor?.id != null &&
+    String(actor.id) !== targetId
+  ) {
+    lines.push(
+      `拉入者：${describeChatMemberUser(actor)}`
+    );
+  } else {
+    lines.push('加入方式：自行加入（无邀请链接记录）');
+  }
+
+  lines.push(
+    '',
+    '访客的全部对话都在管理群的话题里，群成员都能看到。' +
+      '如非有意拉入，请尽快把对方移出群，并检查邀请链接。'
+  );
+
+  await notifyPrimaryAdmins(env, lines.join('\n'));
 }
 
 // 整段对话清空：按 rxmap 配对收集一位访客在私聊与话题两侧的全部消息编号
@@ -10502,7 +11374,8 @@ async function wipeConversationCopies(
 // /clear 的确认按钮回调：clear:yes:<访客ID> / clear:no:<访客ID>。
 async function handleClearCallback(
   callbackQuery,
-  env
+  env,
+  ctx = null
 ) {
   const data = String(callbackQuery.data || '');
   const parts = data.split(':');
@@ -10640,15 +11513,42 @@ async function handleClearCallback(
     '正在清空…'
   );
 
-  const wipe = await wipeConversationCopies(
-    userId,
-    env,
-    true
-  );
+  // 清空执行体走后台：整段清空可能跑满 40 次子请求
+  // 预算，同步挂在回调里会把这条更新的处理拖长。
+  // 确认消息先同步改成「正在清空」，后台跑完再原地
+  // 改成结果报告；claim 的完成以同步部分为准，执行
+  // 本身已有 clearrun 占用防重复执行。无 ctx 的调用
+  // 方（理论上不存在）退回同步执行。
+  const runWipe = async () => {
+    const wipe = await wipeConversationCopies(
+      userId,
+      env,
+      true
+    );
 
-  if (wipe.partial) {
-    const partLines = [
-      `🧹 与访客 ${userId} 的聊天记录已删一部分：`,
+    if (wipe.partial) {
+      const partLines = [
+        `🧹 与访客 ${userId} 的聊天记录已删一部分：`,
+        `· 话题内删除 ${wipe.topic.ok} 条` +
+          (wipe.topic.failed
+            ? `，${wipe.topic.failed} 条删除失败`
+            : ''),
+        `· 私聊删除 ${wipe.private.ok} 条` +
+          (wipe.private.failed
+            ? `，${wipe.private.failed} 条删不掉（多为超过 48 小时）`
+            : ''),
+        `本次调用预算已用完，还有约 ${wipe.remaining} 组消息未处理；` +
+          '再次执行 /clear 可继续。',
+        '话题与访客档案已保留。'
+      ];
+
+      await editConfirm(partLines.join('\n'));
+
+      return;
+    }
+
+    const lines = [
+      `🧹 已清空与访客 ${userId} 的聊天记录：`,
       `· 话题内删除 ${wipe.topic.ok} 条` +
         (wipe.topic.failed
           ? `，${wipe.topic.failed} 条删除失败`
@@ -10657,30 +11557,38 @@ async function handleClearCallback(
         (wipe.private.failed
           ? `，${wipe.private.failed} 条删不掉（多为超过 48 小时）`
           : ''),
-      `本次调用预算已用完，还有约 ${wipe.remaining} 组消息未处理；` +
-        '再次执行 /clear 可继续。',
-      '话题与访客档案已保留。'
+      '话题与访客档案已保留，对方之后仍可继续聊天。'
     ];
 
-    await editConfirm(partLines.join('\n'));
+    await editConfirm(lines.join('\n'));
+  };
+
+  if (ctx?.waitUntil) {
+    await editConfirm(
+      '🧹 正在清空聊天记录，完成后这里会更新为结果报告。'
+    );
+
+    ctx.waitUntil(
+      runWipe().catch(async (error) => {
+        console.error(
+          '后台执行整段清空失败：',
+          error?.message || error
+        );
+
+        try {
+          await editConfirm(
+            '⚠️ 清空执行失败，请重新发送 /clear 重试。'
+          );
+        } catch (_) {
+          /* 确认消息已不可编辑时忽略 */
+        }
+      })
+    );
 
     return;
   }
 
-  const lines = [
-    `🧹 已清空与访客 ${userId} 的聊天记录：`,
-    `· 话题内删除 ${wipe.topic.ok} 条` +
-      (wipe.topic.failed
-        ? `，${wipe.topic.failed} 条删除失败`
-        : ''),
-    `· 私聊删除 ${wipe.private.ok} 条` +
-      (wipe.private.failed
-        ? `，${wipe.private.failed} 条删不掉（多为超过 48 小时）`
-        : ''),
-    '话题与访客档案已保留，对方之后仍可继续聊天。'
-  ];
-
-  await editConfirm(lines.join('\n'));
+  await runWipe();
 }
 
 async function purgeManagedUser(
@@ -10817,7 +11725,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.3.0';
+const BOT_VERSION = 'v1.4.0';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -11025,7 +11933,7 @@ async function maybeCheckForUpdates(env) {
   }
 }
 
-function describeUpdateState(cache) {
+function describeUpdateState(cache, displayTz) {
   if (!cache || !cache.tag) {
     return {
       status: cache ? 'failed' : 'unknown',
@@ -11035,7 +11943,8 @@ function describeUpdateState(cache) {
 
   const timeText = cache.checkedAt
     ? formatTimestamp(
-        Math.floor(cache.checkedAt / 1000)
+        Math.floor(cache.checkedAt / 1000),
+        displayTz
       )
     : '未知';
 
@@ -11065,7 +11974,8 @@ function describeUpdateState(cache) {
 async function handlePauseCallback(
   callbackQuery,
   env,
-  origin = ''
+  origin = '',
+  ctx = null
 ) {
   const senderId = String(callbackQuery.from.id);
   const callbackId = callbackQuery.id;
@@ -11186,7 +12096,7 @@ async function handlePauseCallback(
       return;
     }
 
-    await performResume(env, senderId);
+    await performResume(env, senderId, ctx);
 
     await answerCallback(
       callbackId,
@@ -11240,7 +12150,10 @@ async function handleUpdateCheckCallback(
   );
 
   const described =
-    describeUpdateState(state);
+    describeUpdateState(
+      state,
+      await getDisplayTimeZone(env)
+    );
 
   let text =
     '🔄 <b>检查更新</b>\n\n' +
@@ -11300,7 +12213,7 @@ async function handleUpdateCheckCallback(
 /*                         网页版访客列表（改版新增）                           */
 /* -------------------------------------------------------------------------- */
 
-const USERLIST_LINK_TTL_MS = 30 * 60 * 1000;
+const USERLIST_LINK_TTL_MS = 10 * 60 * 1000;
 
 // 签名链接按用途分权：访客列表（usrlist）/ 网页管理台（panel）/
 // 新手引导（guide）三套签名互不通用——只读性质的引导链接
@@ -11317,6 +12230,21 @@ function panelScopeForPath(path) {
   return 'usrlist';
 }
 
+// 网页链接吊销代次（epoch）：按用途分开存放，管理台可
+// 单独让某一类链接立即失效。epoch 掺入签名载荷——吊销
+// 即代次 +1，旧链接的签名随即对不上、验签失败。验证
+// 链接与通行证不掺 epoch，不受吊销影响。
+async function getLinkEpoch(env, scope) {
+  const raw = await dbConfigGet(
+    `linkepoch:${scope}`,
+    env
+  );
+
+  const n = Number(raw);
+
+  return Number.isInteger(n) && n > 0 ? n : 0;
+}
+
 async function buildSignedPanelUrl(
   origin,
   adminId,
@@ -11325,9 +12253,12 @@ async function buildSignedPanelUrl(
 ) {
   const exp = Date.now() + USERLIST_LINK_TTL_MS;
 
+  const scope = panelScopeForPath(path);
+  const epoch = await getLinkEpoch(env, scope);
+
   const signature = await hmacSha256Hex(
     linkSecret(env),
-    `${panelScopeForPath(path)}:${adminId}:${exp}`
+    `${scope}:${adminId}:${exp}:${epoch}`
   );
 
   const params = new URLSearchParams({
@@ -11381,9 +12312,11 @@ async function checkUserListAuth(
     return null;
   }
 
+  const epoch = await getLinkEpoch(env, scope);
+
   const expected = await hmacSha256Hex(
     linkSecret(env),
-    `${scope}:${id}:${exp}`
+    `${scope}:${id}:${exp}:${epoch}`
   );
 
   if (
@@ -11416,6 +12349,258 @@ async function panelQueryAdminId(
     env,
     scope
   );
+}
+
+/* -------------------------------------------------------------------------- */
+/*                   敏感动作一次性 nonce 与管理审计（新增）                    */
+/* -------------------------------------------------------------------------- */
+
+const NONCE_TTL_MS = 5 * 60 * 1000;
+const AUDIT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+
+const LIST_SENSITIVE_ACTIONS = new Set([
+  'delete',
+  'pass',
+  'trust',
+  'block'
+]);
+
+// 动作语义参数的规范化：签发与消费两侧用同一份规则提取
+// 绑定字段，原始 JSON 的键序、布尔写法差异不造成误判。
+function nonceSemanticParams(action, params) {
+  const p =
+    params && typeof params === 'object' ? params : {};
+
+  if (action === 'delete') {
+    return { deleteTopic: p.deleteTopic === true };
+  }
+
+  if (action === 'trust') {
+    return { trust: p.trust === true };
+  }
+
+  if (action === 'block') {
+    return { block: p.block === true };
+  }
+
+  if (action === 'config_set') {
+    return { value: String(p.value ?? '') };
+  }
+
+  if (action === 'config_toggle') {
+    return { value: p.value === true };
+  }
+
+  if (action === 'config_pause') {
+    const pauseAction = String(p.action || '');
+    const semantic = { action: pauseAction };
+
+    if (pauseAction === 'pause') {
+      semantic.minutes = Number(p.minutes);
+    }
+
+    return semantic;
+  }
+
+  if (action === 'config_list') {
+    const listOp = String(p.op || '');
+    const semantic = { op: listOp };
+
+    if (listOp === 'add') {
+      // 条目内容按服务端落库口径（trim 后）绑定。
+      if (p.value !== undefined) {
+        semantic.value = String(p.value).trim();
+      }
+
+      if (p.pattern !== undefined) {
+        semantic.pattern = String(p.pattern).trim();
+      }
+
+      if (p.response !== undefined) {
+        semantic.response = String(p.response).trim();
+      }
+    }
+
+    if (listOp === 'delete') {
+      // 删除绑「被删条目本身」而非序号：签发与提交之间
+      // 名单若有增删，序号指向的条目变了就对不上、拒绝。
+      semantic.item = String(p.item ?? '');
+    }
+
+    return semantic;
+  }
+
+  return {};
+}
+
+async function nonceParamsHash(action, target, params) {
+  const semantic = nonceSemanticParams(action, params);
+
+  const parts = Object.keys(semantic)
+    .sort()
+    .map((k) => `${k}=${JSON.stringify(semantic[k])}`);
+
+  return hmacSha256Hex(
+    'action-nonce-v1',
+    `${action}|${target}|${parts.join('&')}`
+  );
+}
+
+async function mintActionNonce(
+  env,
+  { adminId, scope, action, target, params }
+) {
+  const nonce = randomId();
+
+  const rec = {
+    a: String(adminId),
+    sc: scope,
+    act: action,
+    t: String(target),
+    ph: await nonceParamsHash(
+      action,
+      String(target),
+      params
+    ),
+    exp: Date.now() + NONCE_TTL_MS
+  };
+
+  await dbConfigPut(
+    `nonce:${nonce}`,
+    JSON.stringify(rec),
+    env
+  );
+
+  return nonce;
+}
+
+// 消费：管理员 / 用途 / 动作 / 目标 / 参数哈希全一致且未
+// 过期，才以「值未变才删」的原子条件删消费掉记录放行。
+// 返回 'ok' 或拒因简码（missing / unknown / expired /
+// mismatch / consumed）。
+async function consumeActionNonce(
+  env,
+  { nonce, adminId, scope, action, target, params }
+) {
+  if (!nonce || typeof nonce !== 'string') {
+    return 'missing';
+  }
+
+  const key = `nonce:${nonce}`;
+  const raw = await dbConfigGet(key, env);
+
+  if (!raw) {
+    return 'unknown';
+  }
+
+  let rec;
+
+  try {
+    rec = JSON.parse(raw);
+  } catch {
+    return 'unknown';
+  }
+
+  if (!rec || Number(rec.exp) <= Date.now()) {
+    await dbConfigDelete(key, env);
+
+    return 'expired';
+  }
+
+  const ph = await nonceParamsHash(
+    action,
+    String(target),
+    params
+  );
+
+  if (
+    String(rec.a) !== String(adminId) ||
+    rec.sc !== scope ||
+    rec.act !== action ||
+    String(rec.t) !== String(target) ||
+    rec.ph !== ph
+  ) {
+    return 'mismatch';
+  }
+
+  const consumed = await dbConfigDeleteIfValue(
+    key,
+    raw,
+    env
+  );
+
+  return consumed ? 'ok' : 'consumed';
+}
+
+// 管理审计只记元数据：谁、何时、对哪个目标、做了什么、
+// 结果如何。绝不记备注全文、配置值与任何 token / 签名。
+async function writeAdminAudit(
+  env,
+  adminId,
+  action,
+  target,
+  result,
+  detail = ''
+) {
+  try {
+    await env.TG_BOT_DB.prepare(
+      'INSERT INTO admin_audit ' +
+        '(ts, admin_id, action, target, result, detail) ' +
+        'VALUES (?, ?, ?, ?, ?, ?)'
+    )
+      .bind(
+        Date.now(),
+        String(adminId || ''),
+        String(action || ''),
+        String(target || ''),
+        String(result || ''),
+        String(detail || '').slice(0, 64)
+      )
+      .run();
+  } catch (error) {
+    console.error(
+      '写入管理审计失败：',
+      error?.message || error
+    );
+  }
+}
+
+async function cleanupOldAuditRows(env) {
+  await env.TG_BOT_DB.prepare(
+    'DELETE FROM admin_audit WHERE ts < ?'
+  )
+    .bind(Date.now() - AUDIT_RETENTION_MS)
+    .run();
+}
+
+// 没被消费的 nonce 记录在过期后顺手清掉，避免 config
+// 表里积压一次性凭据垃圾（按快照值条件删，防误删新行）。
+async function sweepExpiredNonces(env) {
+  const result = await env.TG_BOT_DB.prepare(
+    'SELECT key, value FROM config WHERE key LIKE ?'
+  )
+    .bind('nonce:%')
+    .all();
+
+  const now = Date.now();
+
+  for (const row of result?.results || []) {
+    let exp = 0;
+
+    try {
+      exp = Number(JSON.parse(row.value)?.exp) || 0;
+    } catch {
+      exp = 0;
+    }
+
+    if (!exp || exp <= now) {
+      await dbConfigDeleteIfValue(
+        String(row.key),
+        String(row.value),
+        env
+      );
+    }
+  }
 }
 
 async function signedPageResponse(
@@ -11508,96 +12693,325 @@ async function handleUserListApi(request, env) {
     );
   }
 
+  const url = new URL(request.url);
+
+  // 排序三档与旧前端同口径：active 最近活跃 / new 最新
+  // 注册 / old 最早注册；请求未指定时用服务端存的默认档。
+  const sortConfig = await getConfig(
+    'userlist_sort',
+    env,
+    'active'
+  );
+
+  const sortParam = String(
+    url.searchParams.get('sort') || ''
+  );
+
+  const sort = ['active', 'new', 'old'].includes(sortParam)
+    ? sortParam
+    : ['active', 'new', 'old'].includes(sortConfig)
+      ? sortConfig
+      : 'active';
+
+  const pageSizeDefault = await clampedIntConfig(
+    'userlist_page_size',
+    env,
+    20,
+    5,
+    100
+  );
+
+  let limit = Number(
+    url.searchParams.get('limit')
+  );
+
+  if (!Number.isFinite(limit) || limit <= 0) {
+    limit = pageSizeDefault;
+  }
+
+  limit = Math.min(100, Math.max(5, Math.trunc(limit)));
+
+  // 状态筛选（旧前端的全量过滤语义迁到服务端）：verified /
+  // pending 都要求未封禁——与旧口径一致，封禁者的展示状态
+  // 恒为 blocked，不会同时落进这两档。
+  const stateParam = String(
+    url.searchParams.get('state') || 'all'
+  );
+
+  let stateSql = '';
+  const stateBinds = [];
+
+  if (stateParam === 'verified') {
+    stateSql = 'user_state = ? AND is_blocked = 0';
+    stateBinds.push(USER_STATE.VERIFIED);
+  } else if (stateParam === 'pending') {
+    stateSql = 'user_state = ? AND is_blocked = 0';
+    stateBinds.push(USER_STATE.PENDING);
+  } else if (stateParam === 'blocked') {
+    stateSql = 'is_blocked = 1';
+  }
+
+  // 搜索：备注 / 姓名 / 用户名 / ID 子串匹配。姓名与用户名
+  // 存在 user_info_json 里，按原文子串命中（与旧前端在解析
+  // 后字段上做子串匹配的口径基本一致）；LIKE 通配符先转义，
+  // 搜 '%'、'_' 只按字面量找，全部参数绑定。
+  const q = String(
+    url.searchParams.get('q') || ''
+  ).trim();
+
+  let searchSql = '';
+  const searchBinds = [];
+
+  if (q) {
+    const pattern =
+      '%' +
+      q
+        .replace(/\\/g, '\\\\')
+        .replace(/%/g, '\\%')
+        .replace(/_/g, '\\_') +
+      '%';
+
+    searchSql =
+      "(admin_note LIKE ? ESCAPE '\\' OR " +
+      "user_info_json LIKE ? ESCAPE '\\' OR " +
+      "user_id LIKE ? ESCAPE '\\')";
+
+    searchBinds.push(pattern, pattern, pattern);
+  }
+
+  // 游标分页（keyset）：游标是不透明串，编码 {s 排序档,
+  // k 上页末行排序键值, id 上页末行 user_id}；排序键 + 编号
+  // 组成全序，翻页途中某行活跃时间变化也不会让没变键的
+  // 行被跳过或重复（OFFSET 分页的老毛病）。排序档对不上
+  // 或游标损坏时按第一页处理。
+  const sortCol =
+    sort === 'active' ? 'updated_at' : 'created_at';
+  const sortDir = sort === 'old' ? 'ASC' : 'DESC';
+  const cmp = sort === 'old' ? '>' : '<';
+
+  let cursorSql = '';
+  const cursorBinds = [];
+
+  const cursorRaw = url.searchParams.get('cursor');
+
+  if (cursorRaw) {
+    const decoded = decodeListCursor(cursorRaw);
+
+    if (
+      decoded &&
+      decoded.s === sort &&
+      decoded.id !== undefined &&
+      Number.isFinite(Number(decoded.k))
+    ) {
+      cursorSql =
+        `(${sortCol} ${cmp} ? OR ` +
+        `(${sortCol} = ? AND user_id ${cmp} ?))`;
+
+      cursorBinds.push(
+        Number(decoded.k),
+        Number(decoded.k),
+        String(decoded.id)
+      );
+    }
+  }
+
+  // 排除集合 = 主管理员 + 协管员（与 countUsersWhere 同
+  // 口径）：他们是管理侧账号，不出现在访客列表里。
+  const adminIds = [
+    ...new Set([
+      ...getPrimaryAdminIds(env),
+      ...(await getAuthorizedAdmins(env))
+    ])
+  ];
+
+  const filterSql = [stateSql, searchSql]
+    .filter(Boolean)
+    .join(' AND ');
+
+  const filterBinds = [...stateBinds, ...searchBinds];
+
+  const total = await countUsersWhere(
+    env,
+    filterSql,
+    filterBinds
+  );
+
+  const where = [];
+  const binds = [];
+
+  if (adminIds.length) {
+    where.push(
+      'user_id NOT IN (' +
+        adminIds.map(() => '?').join(',') +
+        ')'
+    );
+
+    binds.push(...adminIds);
+  }
+
+  if (filterSql) {
+    where.push(filterSql);
+    binds.push(...filterBinds);
+  }
+
+  if (cursorSql) {
+    where.push(cursorSql);
+    binds.push(...cursorBinds);
+  }
+
+  // 多取一行判「还有下一页」，不靠总数推算。
   const result = await env.TG_BOT_DB.prepare(
     'SELECT user_id, user_state, is_blocked, ' +
-    'is_muted, is_trusted, relay_exempt, topic_id, ' +
-    'created_at, updated_at, ' +
-    'user_info_json, admin_note FROM users ' +
-    'ORDER BY updated_at DESC LIMIT 1000'
+      'is_muted, is_trusted, relay_exempt, topic_id, ' +
+      'created_at, updated_at, ' +
+      'user_info_json, admin_note FROM users ' +
+      (where.length
+        ? 'WHERE ' + where.join(' AND ') + ' '
+        : '') +
+      `ORDER BY ${sortCol} ${sortDir}, user_id ${sortDir} ` +
+      'LIMIT ?'
   )
+    .bind(...binds, limit + 1)
     .all();
 
-  const rows = result?.results || [];
+  const fetched = result?.results || [];
+  const hasMore = fetched.length > limit;
+  const rows = hasMore
+    ? fetched.slice(0, limit)
+    : fetched;
 
-  // 协管员与主管理员一样是管理侧账号，不是访客：
-  // 不出现在访客列表里（计数口径见 countUsersWhere）。
-  const coAdminIds =
-    await getAuthorizedAdmins(env);
+  // 本页待验证访客的通行证状态：一次 IN 查询批量取，
+  // 不再逐人点读（有效口径不变：记录里的 e 大于当前
+  // 时刻才算证还在）。
+  const passExpById = new Map();
 
-  const users = await Promise.all(
-    rows
+  const pendingKeys = rows
     .filter(
       (user) =>
-        !isPrimaryAdmin(user.user_id, env) &&
-        !coAdminIds.includes(String(user.user_id))
-    )
-    .map(async (user) => {
-      const info = parseUserInfoForList(user);
-
-      let passExp = 0;
-
-      if (
         !user.is_blocked &&
         user.user_state === USER_STATE.PENDING
-      ) {
-        const rec = await passRecordGet(
-          String(user.user_id),
-          env
-        );
+    )
+    .map((user) => `pass:${user.user_id}`);
+
+  if (pendingKeys.length) {
+    const passResult = await env.TG_BOT_DB.prepare(
+      'SELECT key, value FROM config WHERE key IN (' +
+        pendingKeys.map(() => '?').join(',') +
+        ')'
+    )
+      .bind(...pendingKeys)
+      .all();
+
+    for (const row of passResult?.results || []) {
+      try {
+        const rec = JSON.parse(row.value);
 
         if (rec && Number(rec.e) > Date.now()) {
-          passExp = Number(rec.e);
+          passExpById.set(
+            String(row.key).slice('pass:'.length),
+            Number(rec.e)
+          );
         }
+      } catch {
+        /* 坏记录按无证处理 */
       }
+    }
+  }
 
-      return {
-        id: String(user.user_id),
-        name: info.name,
-        username: info.username,
-        state: user.is_blocked
-          ? 'blocked'
-          : String(user.user_state || ''),
-        muted: Boolean(user.is_muted),
-        topic: Boolean(user.topic_id),
-        topic_id: user.topic_id
-          ? String(user.topic_id)
-          : '', 
-        created_at: user.created_at || 0,
-        updated_at: user.updated_at || 0,
-        note: user.admin_note || '',
-        passExp,
-        trusted: Boolean(user.is_trusted),
-        exempt: Boolean(user.relay_exempt)
-      };
-    })
-  );
+  const users = rows.map((user) => {
+    const info = parseUserInfoForList(user);
+
+    return {
+      id: String(user.user_id),
+      name: info.name,
+      username: info.username,
+      state: user.is_blocked
+        ? 'blocked'
+        : String(user.user_state || ''),
+      muted: Boolean(user.is_muted),
+      topic: Boolean(user.topic_id),
+      topic_id: user.topic_id
+        ? String(user.topic_id)
+        : '',
+      created_at: user.created_at || 0,
+      updated_at: user.updated_at || 0,
+      note: user.admin_note || '',
+      passExp:
+        passExpById.get(String(user.user_id)) || 0,
+      trusted: Boolean(user.is_trusted),
+      exempt: Boolean(user.relay_exempt)
+    };
+  });
+
+  let nextCursor = null;
+
+  if (hasMore && rows.length) {
+    const last = rows[rows.length - 1];
+
+    nextCursor = encodeListCursor({
+      s: sort,
+      k: Number(last[sortCol]) || 0,
+      id: String(last.user_id)
+    });
+  }
 
   const groupLinkId = String(
     env.ADMIN_GROUP_ID || ''
   ).replace(/^-100/, '');
 
-  // 列表最多返回最近活跃的 1000 人：把总数与截断标志
-  // 一并给出，页面会明示截断，不再静默看不见老访客。
-  const totalUsers = await countUsersWhere(env, '', []);
-
   return Response.json({
     ok: true,
     group: groupLinkId,
     users,
-    total: totalUsers,
-    truncated: totalUsers > users.length,
+    total,
+    // 游标分页下没有「只看得到前 1000 人」的截断了：
+    // 每一行都能翻页到达。字段保留兼容，恒 false；
+    // total 是当前筛选口径下的精确总数。
+    truncated: false,
+    nextCursor,
     uiDefaults: {
-      sort:
-        await getConfig('userlist_sort', env, 'active'),
-      pageSize: await clampedIntConfig(
-        'userlist_page_size',
-        env,
-        20,
-        5,
-        100
-      )
+      sort: sortConfig,
+      pageSize: pageSizeDefault
     }
   });
+}
+
+function encodeListCursor(obj) {
+  const bytes = new TextEncoder().encode(
+    JSON.stringify(obj)
+  );
+
+  let bin = '';
+
+  for (const b of bytes) {
+    bin += String.fromCharCode(b);
+  }
+
+  return btoa(bin)
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+function decodeListCursor(raw) {
+  try {
+    const b64 = String(raw)
+      .replace(/-/g, '+')
+      .replace(/_/g, '/');
+
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+
+    for (let i = 0; i < bin.length; i++) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+
+    return JSON.parse(
+      new TextDecoder().decode(bytes)
+    );
+  } catch {
+    return null;
+  }
 }
 
 async function countRows(env, sql, binds) {
@@ -11856,8 +13270,10 @@ function buildGuidePage() {
     <a class=\"chip\" href=\"#g-cmd\">命令速查</a>
     <a class=\"chip\" href=\"#g-panel\">网页管理台</a>
     <a class=\"chip\" href=\"#g-users\">访客列表</a>
+    <a class=\"chip\" href=\"#g-members\">成员纪律</a>
     <a class=\"chip\" href=\"#g-update\">版本更新</a>
     <a class=\"chip\" href=\"#g-faq\">常见问题</a>
+    <a class=\"chip\" href=\"#g-limits\">不支持清单</a>
   </div>
 </header>
 <main>
@@ -11888,14 +13304,14 @@ function buildGuidePage() {
     <p>验证是用来挡垃圾机器人和广告号的：没通过验证的人，发什么都不会转进群里。</p>
     <ul>
       <li><b class=\"k\">Turnstile 小程序验证（推荐）：</b>访客点「开始验证」按钮，弹出一个小页面自动完成人机校验，几秒通过，体验最顺。验证链接绑定访客本人，必须在 Telegram 里点开，转发给别人或用浏览器打开都用不了。</li>
-      <li><b class=\"k\">静态问答验证：</b>你出一道题，访客答对才放行；答案可以准备多个，用竖线 <code>|</code> 分隔，答中任意一个都算对。连着答错 5 次会被锁定 30 分钟（防有人对着答案穷举），锁定期间他发什么都不会有回应，过后自动解锁。次数和时长可以在管理台「基础配置」里改。</li>
+      <li><b class=\"k\">静态问答验证：</b>你出一道题，访客答对才放行；答案可以准备多个，用竖线 <code>|</code> 分隔，答中任意一个都算对。连着答错 5 次会被锁定 30 分钟（防有人对着答案穷举），锁定期间他发什么都不会有回应，过后自动解锁。次数和时长可以在管理台「基础配置」里改。注意：自带的示例题答案就写在机器人简介里、人人可查，正式用问答模式前，务必把问题和答案换成你自己的（答案还是默认值时，管理台会标红提醒）。</li>
             <li><b class=\"k\">顺序点击验证：</b>不用打开网页、也不用打字：机器人发一条带九宫格按钮的消息，访客按正文给出的顺序、在 60 秒内点完 4–5 个同类 emoji 即通过；每点对一个，盘面会重新洗牌；点错会换一整道新题，连错锁定与静态问答共用同一套次数与时长设置。</li>
-<li><b class=\"k\">在哪里切换：</b>网页管理台 → 基础配置 → 验证方式。选了 Turnstile 后，问题和答案两项会自动隐藏；如果还没配好 Turnstile 密钥，机器人会自动用问答模式兜底，不会把人卡死。</li>
+<li><b class=\"k\">在哪里切换：</b>网页管理台 → 基础配置 → 验证方式。选了 Turnstile 后，问题和答案两项会自动隐藏；如果还没配好 Turnstile 密钥，验证不会自动降级成问答（默认答案公开可抄，降级等于没验证）：访客会看到「验证服务尚未配置完成」的提示，机器人也会私聊提醒你补齐密钥、或改选静态问答 / 顺序点击。</li>
       <li><b class=\"k\">让某人重新验证：</b>打开他的话题，发送 <code>/reverify</code>，他下一次发消息前要重新过一遍验证。</li>
       <li><b class=\"k\">自己先试一遍：</b>私聊发送 <code>/testverify</code> 会拿到一个测试验证链接，点开能看到访客眼中的验证页长什么样；测试模式只是看看样子，不会真的放行或记录任何人。</li>
       <li><b class=\"k\">🎫 一次性通行证（救济通道）：</b>个别访客怎么也过不了验证（比如网络连不上验证服务）时，在访客列表里他那一行点「🎫 通行证」，机器人会私聊发给他一张通行证（默认 30 分钟内有效，有效期可在管理台「基础配置」里改），他点开确认即通过验证。通行证必须本人点开才有效，转发给别人没用，用过即作废；不依赖 Turnstile 配置，没配密钥也能发。</li>
       <li><b class=\"k\">🤝 信任：</b>熟人可以免掉验证：在访客列表他那一行点「🤝 信任」，或在他话题的资料卡上点「设为信任」，他立即通过验证（会收到验证成功提示）。信任只有一个开关，开启后一并免验证、免转发限流、免类型过滤、免超时清理（删档版与温和版都免）；但屏蔽关键词与关键词自动封禁对他仍然有效。点「取消信任」收回。注意：对他「重置验证」或在话题里发 /reverify 会连信任一起撤销；被封禁的人要先解封才能设信任；资料卡上的信任按钮只有主管理员能操作。</li>
-      <li><b class=\"k\">验证消息会自己清理：</b>验证提示、欢迎消息、通行证和「🎉 验证成功」这类流程消息，用完后会被机器人自动删掉，不在访客对话里堆积：反复索要验证只留最新一条提示，通过验证时提示、欢迎消息和访客自己发的那条 /start 会一并清掉，成功提示等他第一条正经消息送达后再删；过期没用的通行证会在他下次来发消息时清扫。</li>
+      <li><b class=\"k\">验证消息会自己清理：</b>验证提示、欢迎消息、通行证和「🎉 验证成功」这类流程消息，用完后会被机器人自动删掉，不在访客对话里堆积：反复索要验证只留最新一条提示，通过验证时提示、欢迎消息和访客自己发的那条 /start 会一并清掉，成功提示在他发出第一条消息、刚进入处理时就清掉（那条消息就算被关键词、类型过滤或限流拦下也照清）；过期没用的通行证会在他下次来发消息时清扫。</li>
     </ul>
   </section>
 
@@ -11909,7 +13325,7 @@ function buildGuidePage() {
       <li><b class=\"k\">整段对话清空：</b>在话题里发 <code>/clear</code> 并点确认，会把这个话题里的转发副本和访客私聊里的聊天副本成批删掉，话题本身保留、之后还能接着聊；48 小时前的私聊消息删不掉，清完会在话题里报告删了多少、多少删不掉。这个操作只有主管理员能做，协管员发命令或点确认都会被拦下。</li>
       <li><b class=\"k\">表情回应会同步：</b>你给某条消息贴的 emoji，对方那边也会贴上（会显示成机器人贴的，因为 Telegram 只允许机器人以自己的名义贴）。</li>
       <li><b class=\"k\">拉黑有提醒：</b>访客把机器人拉黑时，他的话题里会出现 🚫 提醒；他取消拉黑时有 ✅ 提醒，不用你去猜他还在不在；发出 ✅ 提醒的同时，之前那条 🚫 提醒会被一并删掉，话题里只留最新状态。</li>
-      <li><b class=\"k\">转发失败有提醒：</b>极少数消息（比如带内容保护的内容）机器人复制不了、转不进话题时，会在话题里留一行 ⚠️ 提醒你留意（对方还以为发送成功了）；要是在群里手动关闭了某个话题，访客再发消息时机器人会先把话题重新打开再投递，不会另建新话题；访客短时间内发得太频繁时，超出部分会被限流丢弃，并在话题里提醒一次。</li>
+      <li><b class=\"k\">转发失败有提醒：</b>投票、位置、游戏这类本体转不过来的消息，会在话题里落一张占位卡、访客那边也会收到一句提示（见文末「不支持清单」）；其他复制失败会在话题里留一行 ⚠️ 提醒你留意；要是在群里手动关闭了某个话题，访客再发消息时机器人会先把话题重新打开再投递，不会另建新话题；访客短时间内发得太频繁时，超出部分会被限流丢弃，并在话题里提醒一次。</li>
       <li><b class=\"k\">命令回执不留痕：</b>你在话题里发出的命令消息，会在处理后立即被撤回；/note 的查看与保存、/notedelete、/reverify、/ban、/unban、/card 重建、话题里 /pause 与 /resume 的结果提示，还有打错命令时的「未识别的命令」提示，都是短暂显示，约 5 秒后自动删除，话题里不会堆积这类回执。例外：/note 保存失败（比如备注超长）时，命令原文会保留下来，方便你照着改短了重发。</li>
       <li><b class=\"k\">被轰炸时先开启服务熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客新发的消息会被机器人当场删除、不补送——消息发出去就消失，就是还在暂停的信号；对熔断前已送达消息的编辑和反应照常同步到话题副本，两边记录保持一致；开启服务熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息；恢复服务时，那条「请稍后再试」会自动改成「✅ 服务已恢复」，访客一看便知（暂停期间收到这条回复的人很多时，会在恢复后的头几条消息里分批改完）。到期自动恢复（恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的），也可随时 <code>/resume</code> 提前恢复。</li>
     </ul>
@@ -11946,9 +13362,10 @@ function buildGuidePage() {
       <li><b class=\"k\">自动回复：</b>访客的话包含某个词时，机器人自动回一句你预设的话（比如包含「价格」就自动回价目说明）。</li>
       <li><b class=\"k\">协管员：</b>把帮你接待的人的 Telegram 数字 ID 填进来（多个用逗号隔开）。协管员能在话题里回复、用命令、贴表情，但进不了网页管理台，也看不到访客列表。</li>
       <li><b class=\"k\">服务熔断：</b>被消息轰炸时在这里一键暂停机器人（或用 /pause 命令），可设定暂停时长、到期自动恢复；还能设置暂停期间给访客的回复语句，或关掉回复保持完全静默。</li>
-      <li><b class=\"k\">文案与呈现：</b>验证成功 / 答错、熔断恢复、拉黑 / 解封这几句机器人说的话，能改成你自己的口气；话题名的样式（备注在前还是名字在前、带不带 ID）、主菜单上显示哪些按钮、访客列表默认排序与每页条数，也都在这里。</li>
+      <li><b class=\"k\">文案与呈现：</b>验证成功 / 答错、熔断恢复、拉黑 / 解封这几句机器人说的话，能改成你自己的口气；话题名的样式（备注在前还是名字在前、带不带 ID）、主菜单上显示哪些按钮、访客列表默认排序与每页条数、时间显示的时区（默认 Asia/Singapore），也都在这里。</li>
+      <li><b class=\"k\">安全与审计：</b>网页链接万一泄露（截图、转发、浏览器历史都可能漏出去），可以在这里一键让访客列表 / 网页管理台 / 新手引导某一页的已发链接全部失效，再重新发送 /start 换新链接；谁在什么时候做过删除、发通行证、改配置这类敏感操作，这里也留有一份审计记录可查（保留 90 天）。</li>
     </ul>
-    <div class=\"tip\">管理台的网页链接 30 分钟过期；打开时、或者开着页面闲置超时后保存时，都会提示过期，重新发送 /start、在新主菜单上重新打开就行。</div>
+    <div class=\"tip\">管理台的网页链接 10 分钟过期；打开时、或者开着页面闲置超时后保存时，都会提示过期，重新发送 /start、在新主菜单上重新打开就行。</div>
   </section>
 
   <section id=\"g-users\">
@@ -11958,6 +13375,16 @@ function buildGuidePage() {
       <li><b class=\"k\">找人：</b>顶部搜索框可以按名字、用户名、数字 ID、甚至你写的备注来搜；下面的「全部 / 已验证 / 待验证 / 已屏蔽」是快速筛选；还能换排序顺序。</li>
       <li><b class=\"k\">对某个人操作：</b>每行有「重置验证」（让他重新验证）、「话题」（一键跳到话题群里和他的对话）、「删除」（“仅删除记录”只删机器人这边的档案，话题和聊天记录都不动；“连话题、私聊一起清空”会连群里的话题、和访客与机器人私聊里的聊天副本一起清掉，私聊里 48 小时前的消息删不掉，清完会报告条数）、「🎫 通行证」（给还没通过验证的人发一张一次性通行证，他点开确认即可通过）和「备注」（写一句只有管理员看得到的话，会同步显示到他的资料卡上）。发完通行证后，他那一行会出现「🎫 已发证 · 剩 N 分钟」徽标，按钮变成「🎫 重新发放」，他用证通过后徽标自动消失。行里还有「🤝 信任」（只有一个信任开关：免验证、免转发限流、免类型过滤、免超时清理，见「验证」一节；关键词封禁对他照常有效）和「🚫 屏蔽 / ✅ 解封」（与 /ban、/unban 同一套封禁：屏蔽后他再发来的新消息会被立即删掉；解封时他会收到一条解除通知）；设为信任的人行上会挂「🤝 已信任」徽标，屏蔽中的人挂「已屏蔽」徽标。</li>
       <li><b class=\"k\">统计页：</b>能看到访客总数、已验证 / 待验证人数，以及过去 24 小时、7 天、30 天分别新增了多少人、多少人活跃、收发了多少条消息。提醒一句：消息量是按转发记录数的，系统只留最近 90 天，所以统计最多往前看 90 天。</li>
+    </ul>
+  </section>
+
+  <section id=\"g-members\">
+    <h2>🛡 管理群成员纪律</h2>
+    <ul>
+      <li><b class=\"k\">群里能看，就等于能看全部对话：</b>每位访客的对话都在管理群的话题里，任何群成员都能翻看全部话题与资料卡（姓名、用户名、ID、你写的备注）。机器人能拦住非管理员在话题里发言、发命令，<b class=\"k\">拦不住阅读</b>——所以管理群的成员必须严格只限主管理员与协管员本人，不要把任何其他人拉进这个群。</li>
+      <li><b class=\"k\">看门狗只负责事后发现：</b>名单外账号（不是机器人自己、主管理员、协管员）进入管理群时，机器人会私聊告警全体主管理员：是谁、被谁拉入、经哪个邀请链接。但告警响起时对方可能已经看到话题历史了——它负责发现，不负责预防。</li>
+      <li><b class=\"k\">预防靠群设置，建群后先做两件：</b>① 把「新成员可查看历史消息」关掉（群资料 → 编辑 → 聊天历史记录可见性，不同客户端叫法略有差异），新人进群就看不到旧话题；② 只让管理员能拉人：成员权限里关掉普通成员的「添加成员」，不用的邀请链接及时撤销。</li>
+      <li><b class=\"k\">收到告警怎么办：</b>先确认是不是自己或协管员有意拉的人；不是的话立刻把对方移出群，再检查并重置邀请链接。</li>
     </ul>
   </section>
 
@@ -11983,8 +13410,20 @@ function buildGuidePage() {
     <p class=\"q\">访客说验证一直过不了，怎么办？</p>
     <p>先让他换个网络或重启 App 再试。还是不行，就给他发一张一次性通行证：打开访客列表，在他那一行点「🎫 通行证」，机器人会私聊发给他一张 30 分钟有效的通行证，他点开确认就能通过，不用再折腾验证。你也可以发 /testverify 自己点一遍，看看验证页是否正常，或者在管理台临时把验证方式切成静态问答或顺序点击，让他先通过。</p>
     <p class=\"q\">网页打开提示「链接无效或已过期」？</p>
-    <p>管理台、访客列表和这本引导的链接都是 30 分钟有效的签名链接：打开时报错、或者页面开久了点保存提示「链接已过期」，都是它到期了。重新发送 /start，在新主菜单上重新打开即可；保存失败的那次修改不会生效，记得重新填一遍。</p>
+    <p>管理台、访客列表和这本引导的链接都是 10 分钟有效的签名链接：打开时报错、或者页面开久了点保存提示「链接已过期」，都是它到期了。重新发送 /start，在新主菜单上重新打开即可；保存失败的那次修改不会生效，记得重新填一遍。</p>
   </section>
+
+  <section id=\"g-limits\">
+    <h2>🚧 已知不支持清单</h2>
+    <p>下面这些消息类型，Telegram 没有给机器人留「原样转发本体」的路。访客发来、本体复制失败时，话题里会落一张「📩 访客发来一条『类型』，机器人无法转发本体。」的<b class=\"k\">占位卡</b>，访客那边也会收到一句「这类消息机器人暂时无法转达，已提醒管理员。」（10 分钟内只提示一次）。占位卡和普通转发消息一样建了配对：你在话题里<b class=\"k\">回复占位卡，回复照样能转到访客私聊</b>；用 /delete 删占位卡，也会连带处理那条原消息。</p>
+    <ul>
+      <li><b class=\"k\">投票：</b>投票本体转不过来，话题里只有占位卡——投不了票，也看不到选项与结果。需要表决时，让访客用文字把想法发过来。</li>
+      <li><b class=\"k\">实时位置：</b>位置本体转不过来；实时位置的后续移动走的是「编辑消息」，机器人不处理位置类编辑，位置不会跟着更新。一次性位置同样只有占位卡。</li>
+      <li><b class=\"k\">游戏、发票：</b>本体转不过来，里面的交互（开始游戏、付款）也用不了，只有占位卡。</li>
+      <li><b class=\"k\">联系人名片、骰子动画等特殊类型：</b>复制失败时同样落占位卡；能正常复制的（骰子动画通常可以）一切照旧，不会出现占位卡。</li>
+      <li><b class=\"k\">受保护内容：</b>来源聊天开了「禁止转发 / 保存」时，消息无法被复制，占位卡会标明是『受保护内容』。</li>
+    </ul>
+    <p>另外一句：机器人里的时间显示（资料卡、编辑对比通知、更新检查时间等）按管理台「文案与呈现」里的<b class=\"k\">时间显示时区</b>渲染，默认 Asia/Singapore；访客列表页的「最近活跃」按打开页面那台设备的浏览器时区显示，与这个设置无关。</p>
 
 </main>
 <script>
@@ -12124,6 +13563,7 @@ function buildPanelPage() {
     <a class="chip" href="#sec-admin">协管员</a>
     <a class="chip" href="#sec-pause">服务熔断</a>
     <a class="chip" href="#sec-style">文案与呈现</a>
+    <a class="chip" href="#sec-security">安全与审计</a>
   </div>
 </header>
 <main id="main">
@@ -12162,11 +13602,11 @@ function buildPanelPage() {
     <button class="save" data-k="reverify_ttl_days" data-t="f_rvttl">保存</button>
     <h2>⚙️ 参数与开关</h2>
     <div class="hint">说明：把问答「连错锁定次数」调小后，之前已答错多次的访客会按新次数提前锁定；已经在锁定期内的访客按落锁时的时长走完。验证链接与通行证的有效期调短，不影响已经发出去的（按发出时的时长到期）。</div>
-    <label>转发限流：突发条数（1～1000）</label>
-    <input type="number" id="t_burst" min="1" max="1000" step="1">
+    <label>转发限流：突发条数（1～100）</label>
+    <input type="number" id="t_burst" min="1" max="100" step="1">
     <button class="save" data-k="relay_burst" data-t="t_burst">保存</button>
-    <label>转发限流：每秒回填条数（1～100）</label>
-    <input type="number" id="t_refill" min="1" max="100" step="1">
+    <label>转发限流：每秒回填条数（1～20）</label>
+    <input type="number" id="t_refill" min="1" max="20" step="1">
     <button class="save" data-k="relay_refill_per_sec" data-t="t_refill">保存</button>
     <label>通行证有效期（分钟，1～1440）</label>
     <input type="number" id="t_passmin" min="1" max="1440" step="1">
@@ -12312,6 +13752,23 @@ function buildPanelPage() {
     <label>访客列表每页条数（5～100）</label>
     <input type="number" id="s_pagesize" min="5" max="100" step="1">
     <button class="save" data-k="userlist_page_size" data-t="s_pagesize">保存</button>
+    <label>时间显示时区（IANA 时区名）</label>
+    <input type="text" id="s_tz">
+    <div class="hint">影响资料卡的首次消息时间、编辑对比通知、主菜单更新检查时间等机器人内的时间显示；访客列表页的「最近活跃」按打开页面那台设备的浏览器时区显示，不受这里影响。</div>
+    <button class="save" data-k="display_tz" data-t="s_tz">保存</button>
+  </section>
+
+  <section id="sec-security" hidden>
+    <h2>🔐 安全与审计</h2>
+    <label>网页链接立即吊销</label>
+    <div class="hint">怀疑某一类网页链接已经泄露时，可单独让它立即失效：失效的只是那一类页面链接，不影响另外两类页面，也不影响机器人里正在进行的验证与一次性通行证链接。</div>
+    <button class="save danger" id="revoke_usrlist">吊销访客列表链接</button>
+    <button class="save danger" id="revoke_guide">吊销新手引导链接</button>
+    <button class="save danger" id="revoke_panel">吊销管理台链接（本页也会失效）</button>
+    <label>管理操作审计（最近 100 条，保留 90 天）</label>
+    <div class="hint">删除访客、发通行证、改信任与屏蔽、改配置、吊销链接的成功与失败都会记在这里。只记谁在何时对谁做了什么，不记备注内容与配置值。</div>
+    <button class="save" id="audit_load">刷新审计记录</button>
+    <div id="audit_list"><div class="empty">点上面的按钮加载</div></div>
   </section>
 </main>
 <div id="toast"></div>
@@ -12337,7 +13794,7 @@ function toast(msg) {
   setTimeout(function () { t.style.display = 'none'; }, 2200);
 }
 
-var ERROR_TEXT = { unauthorized: '链接已过期，重新发送 /start 换新菜单', 'too large': '内容太长', 'bad json': '请求格式错误', 'bad userId': '参数错误' };
+var ERROR_TEXT = { unauthorized: '链接已过期，重新发送 /start 换新菜单', 'too large': '内容太长', 'bad json': '请求格式错误', 'bad userId': '参数错误', nonce_invalid: '操作凭据已失效，请重试' };
 function translateError(d) {
   if (d && d.error && ERROR_TEXT[d.error]) d.error = ERROR_TEXT[d.error];
   return d;
@@ -12350,6 +13807,27 @@ function post(path, extra) {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(b)
   }).then(function (r) { return r.json(); }).then(translateError);
+}
+
+// 改配置属敏感动作：先向服务端领一张绑 {键, 值} 的一次性
+// 凭据（5 分钟内有效、用后即焚），再带着凭据提交保存。
+function saveConfig(key, value) {
+  return post('/api/nonce', { scope: 'panel', action: 'config_set', target: key, params: { value: String(value) } }).then(function (m) {
+    if (!m || !m.ok || !m.nonce) return { ok: false, error: (m && m.error) || '凭据签发失败' };
+    return post('/api/config/set', { key: key, value: value, nonce: m.nonce });
+  });
+}
+
+// 开关切换、熔断、名单增删与保存配置共用同一套一次性凭
+// 证：先领绑 {动作, 目标, 语义参数} 的凭据，再带着提交。
+function mintThen(path, action, target, params, payload) {
+  return post('/api/nonce', { scope: 'panel', action: action, target: target, params: params }).then(function (m) {
+    if (!m || !m.ok || !m.nonce) return { ok: false, error: (m && m.error) || '凭据签发失败' };
+    var b = {};
+    for (var k in payload) b[k] = payload[k];
+    b.nonce = m.nonce;
+    return post(path, b);
+  });
 }
 
 function renderKw() {
@@ -12373,7 +13851,7 @@ function renderKw() {
     b.textContent = '删除';
     b.onclick = function () {
       b.disabled = true;
-      post('/api/config/list', { key: 'block_keywords', op: 'delete', index: i }).then(function (d) {
+      mintThen('/api/config/list', 'config_list', 'block_keywords', { op: 'delete', item: kw }, { key: 'block_keywords', op: 'delete', index: i }).then(function (d) {
         if (d.ok) { KW = d.keywords; toast('已删除'); renderKw(); }
         else { b.disabled = false; toast('删除失败：' + (d.error || '')); }
       });
@@ -12408,7 +13886,7 @@ function renderRp() {
     b.textContent = '删除';
     b.onclick = function () {
       b.disabled = true;
-      post('/api/config/list', { key: 'keyword_responses', op: 'delete', index: i }).then(function (d) {
+      mintThen('/api/config/list', 'config_list', 'keyword_responses', { op: 'delete', item: String(r.id || '') }, { key: 'keyword_responses', op: 'delete', index: i }).then(function (d) {
         if (d.ok) { RP = d.autoReplies; toast('已删除'); renderRp(); }
         else { b.disabled = false; toast('删除失败：' + (d.error || '')); }
       });
@@ -12432,7 +13910,7 @@ function renderFilters(vals) {
     c.checked = !!vals[def[0]];
     c.onchange = function () {
       var want = c.checked;
-      post('/api/config/toggle', { key: def[0], value: want }).then(function (d) {
+      mintThen('/api/config/toggle', 'config_toggle', def[0], { value: want }, { key: def[0], value: want }).then(function (d) {
         if (d.ok) toast(def[1] + (want ? ' 已开启' : ' 已关闭'));
         else { c.checked = !want; toast('修改失败：' + (d.error || '')); }
       }).catch(function () { c.checked = !want; toast('修改失败'); });
@@ -12449,10 +13927,10 @@ for (var i = 0; i < saveBtns.length; i++) {
     var key = btn.getAttribute('data-k');
     var el = document.getElementById(btn.getAttribute('data-t'));
     if (key === 'menu_btn_panel' && el.value === 'false') {
-      if (!confirm('关掉后主菜单里将不再有管理台入口。之后可私聊发送 /panel 临时打开管理台（链接 30 分钟内有效），确认关闭？')) return;
+      if (!confirm('关掉后主菜单里将不再有管理台入口。之后可私聊发送 /panel 临时打开管理台（链接 10 分钟内有效），确认关闭？')) return;
     }
     btn.disabled = true;
-    post('/api/config/set', { key: key, value: el.type === 'checkbox' ? String(el.checked) : el.value }).then(function (d) {
+    saveConfig(key, el.type === 'checkbox' ? String(el.checked) : el.value).then(function (d) {
       btn.disabled = false;
       if (d.ok) toast('已保存');
       else toast('保存失败：' + (d.error || ''));
@@ -12464,7 +13942,7 @@ document.getElementById('kw_add').onclick = function () {
   var el = document.getElementById('kw_new');
   var v = el.value.trim();
   if (!v) { toast('先输入关键词'); return; }
-  post('/api/config/list', { key: 'block_keywords', op: 'add', value: v }).then(function (d) {
+  mintThen('/api/config/list', 'config_list', 'block_keywords', { op: 'add', value: v }, { key: 'block_keywords', op: 'add', value: v }).then(function (d) {
     if (d.ok) { KW = d.keywords; el.value = ''; toast('已添加'); renderKw(); }
     else toast('添加失败：' + (d.error || ''));
   });
@@ -12473,14 +13951,14 @@ document.getElementById('kw_add').onclick = function () {
 document.getElementById('rp_add').onclick = function () {
   var p = document.getElementById('rp_pattern');
   var r = document.getElementById('rp_response');
-  post('/api/config/list', { key: 'keyword_responses', op: 'add', pattern: p.value, response: r.value }).then(function (d) {
+  mintThen('/api/config/list', 'config_list', 'keyword_responses', { op: 'add', pattern: p.value, response: r.value }, { key: 'keyword_responses', op: 'add', pattern: p.value, response: r.value }).then(function (d) {
     if (d.ok) { RP = d.autoReplies; p.value = ''; r.value = ''; toast('规则已添加'); renderRp(); }
     else toast('添加失败：' + (d.error || ''));
   });
 };
 
 document.getElementById('admins_clear').onclick = function () {
-  post('/api/config/set', { key: 'authorized_admins', value: '' }).then(function (d) {
+  saveConfig('authorized_admins', '').then(function (d) {
     if (d.ok) { document.getElementById('f_admins').value = ''; toast('协管员已清空'); }
     else toast('清空失败：' + (d.error || ''));
   });
@@ -12498,13 +13976,13 @@ function renderPauseStatus(st) {
 document.getElementById('pause_start').onclick = function () {
   var m = Number(document.getElementById('f_pause_min').value);
   if (!Number.isInteger(m) || m < 1 || m > 10080) { toast('暂停时长必须是 1～10080 的整数分钟'); return; }
-  post('/api/config/pause', { action: 'pause', minutes: m }).then(function (d) {
+  mintThen('/api/config/pause', 'config_pause', 'pause', { action: 'pause', minutes: m }, { action: 'pause', minutes: m }).then(function (d) {
     if (d.ok) { renderPauseStatus(d.pause_state); toast('已暂停机器人'); }
     else toast('暂停失败：' + (d.error || ''));
   });
 };
 document.getElementById('pause_resume').onclick = function () {
-  post('/api/config/pause', { action: 'resume' }).then(function (d) {
+  mintThen('/api/config/pause', 'config_pause', 'resume', { action: 'resume' }, { action: 'resume' }).then(function (d) {
     if (d.ok) { renderPauseStatus(d.pause_state); toast('已恢复服务'); }
     else toast('恢复失败：' + (d.error || ''));
   });
@@ -12516,10 +13994,26 @@ function applyPauseReply() {
 }
 document.getElementById('f_pausereplymode').addEventListener('change', applyPauseReply);
 
+var vmodeReady = true;
+var vmodeAnswerIsDefault = false;
+function refreshVmodeHint() {
+  var el = document.getElementById('vmode_hint');
+  if (!el) return;
+  var mode = document.getElementById('f_verifymode').value;
+  var msg = '';
+  if (mode === 'turnstile' && !vmodeReady) {
+    msg = '⚠️ 未生效：尚未配置 Turnstile 密钥，访客将无法完成验证（不再自动回退问答）。请补齐密钥，或改选其他验证方式。';
+  } else if (mode === 'quiz' && vmodeAnswerIsDefault) {
+    msg = '⚠️ 当前验证答案还是默认值：默认问题与答案都是公开的，照抄即可通过，等于没有验证。请在下方把验证答案改掉。';
+  }
+  el.textContent = msg;
+  el.style.color = msg ? '#ff8a8a' : '';
+}
 function applyVmode() {
   var quiz = document.getElementById('f_verifymode').value === 'quiz';
   document.getElementById('w_verifq').style.display = quiz ? '' : 'none';
   document.getElementById('w_verifa').style.display = quiz ? '' : 'none';
+  refreshVmodeHint();
 }
 document.getElementById('f_verifymode').addEventListener('change', applyVmode);
 
@@ -12567,7 +14061,9 @@ fetch('/api/config?' + qs.toString())
     setVal('f_verifa', d.verif_a || '');
     setVal('f_verifymode', d.verify_mode || 'turnstile');
     applyVmode();
-    setText('vmode_hint', d.turnstileReady ? '' : '提示：尚未配置 TURNSTILE 密钥，即使选择 Turnstile 也会自动回退为静态问答。');
+    vmodeReady = !!d.turnstileReady;
+    vmodeAnswerIsDefault = String(d.verif_a || '').trim() === '3';
+    refreshVmodeHint();
     setVal('f_ttl', d.verified_ttl_days);
     setVal('f_rvttl', d.reverify_ttl_days);
     setVal('f_threshold', d.block_threshold);
@@ -12601,6 +14097,7 @@ fetch('/api/config?' + qs.toString())
     setVal('m_pause', d.menu_buttons && d.menu_buttons.pause ? 'true' : 'false');
     setVal('s_sort', d.userlist_sort || 'active');
     setVal('s_pagesize', d.userlist_page_size);
+    setVal('s_tz', d.display_tz || 'Asia/Singapore');
     KW = d.keywords || [];
     RP = d.autoReplies || [];
     renderFilters(d.filters || {});
@@ -12689,6 +14186,49 @@ window.addEventListener('scroll', function () {
   pSpyTick = true;
   requestAnimationFrame(function () { pSpyTick = false; pSpy(); });
 }, { passive: true });
+
+function revokeLinks(scope, label) {
+  var extra = scope === 'panel' ? '\\n注意：本管理台页面也会立即失效，需回机器人主菜单重新打开。' : '';
+  if (!confirm('确认让所有「' + label + '」网页链接立即失效？' + extra)) return;
+  post('/api/config/revoke-links', { scope: scope }).then(function (d) {
+    if (d.ok) toast('已吊销：' + label + '的旧链接全部失效');
+    else toast('吊销失败：' + (d.error || ''));
+  }).catch(function () { toast('吊销失败'); });
+}
+document.getElementById('revoke_panel').onclick = function () { revokeLinks('panel', '网页管理台'); };
+document.getElementById('revoke_usrlist').onclick = function () { revokeLinks('usrlist', '访客列表'); };
+document.getElementById('revoke_guide').onclick = function () { revokeLinks('guide', '新手引导'); };
+
+var AUDIT_ACTION = { config_set: '改配置', delete: '删除访客', pass: '发通行证', trust: '信任变更', block: '屏蔽变更', revoke_links: '吊销链接' };
+function loadAudit() {
+  var box = document.getElementById('audit_list');
+  box.textContent = '加载中…';
+  fetch('/api/audit?' + qs.toString()).then(function (r) { return r.json(); }).then(function (d) {
+    if (!d.ok) { box.textContent = '加载失败：' + (d.error || ''); return; }
+    box.textContent = '';
+    if (!d.rows.length) {
+      var e = document.createElement('div');
+      e.className = 'empty';
+      e.textContent = '暂无记录';
+      box.appendChild(e);
+      return;
+    }
+    d.rows.forEach(function (row) {
+      var item = document.createElement('div');
+      item.className = 'item';
+      var tx = document.createElement('div');
+      tx.className = 'tx';
+      tx.textContent = (AUDIT_ACTION[row.action] || row.action) + ' · 目标 ' + (row.target || '-') + ' · ' + row.result + (row.detail ? '（' + row.detail + '）' : '');
+      var sub = document.createElement('div');
+      sub.className = 'sub';
+      sub.textContent = (row.ts ? new Date(row.ts).toLocaleString('zh-CN', { hour12: false }) : '-') + ' · 管理员 ' + (row.admin_id || '-');
+      tx.appendChild(sub);
+      item.appendChild(tx);
+      box.appendChild(item);
+    });
+  }).catch(function () { box.textContent = '加载失败'; });
+}
+document.getElementById('audit_load').onclick = loadAudit;
 </script>
 </body>
 </html>`;
@@ -12808,8 +14348,8 @@ function validateScalarConfig(key, rawValue) {
   }
 
   const INT_RANGES = {
-    relay_burst: [1, 1000, '限流突发条数'],
-    relay_refill_per_sec: [1, 100, '限流每秒回填'],
+    relay_burst: [1, 100, '限流突发条数'],
+    relay_refill_per_sec: [1, 20, '限流每秒回填'],
     pass_ttl_min: [1, 1440, '通行证有效分钟'],
     verify_link_min: [1, 120, '验证链接有效分钟'],
     quiz_max_attempts: [1, 20, '问答锁定答错次数'],
@@ -12906,6 +14446,33 @@ function validateScalarConfig(key, rawValue) {
     }
 
     return { value: raw };
+  }
+
+  if (key === 'display_tz') {
+    const value = raw.trim();
+
+    if (!value) {
+      return { error: '时区不能为空' };
+    }
+
+    if (value.length > 64) {
+      return { error: '时区名过长' };
+    }
+
+    // 用 Intl 试建把关：非法 IANA 名直接拒绝保存，不让
+    // 坏值落库后再靠读侧回退兜底（读侧回退只管带外写入）。
+    try {
+      new Intl.DateTimeFormat('zh-CN', {
+        timeZone: value
+      });
+    } catch (_) {
+      return {
+        error:
+          '时区无效：请填写 IANA 时区名（如 Asia/Singapore）'
+      };
+    }
+
+    return { value };
   }
 
   if (key === 'authorized_admins') {
@@ -13154,9 +14721,9 @@ async function handleConfigApi(request, env) {
     authorizedAdmins: parseAuthorizedAdmins(
       cfg('authorized_admins', '[]')
     ),
-    relay_burst: clampShow('relay_burst', 30, 1, 1000),
+    relay_burst: clampShow('relay_burst', 30, 1, 100),
     relay_refill_per_sec:
-      clampShow('relay_refill_per_sec', 5, 1, 100),
+      clampShow('relay_refill_per_sec', 5, 1, 20),
     pass_ttl_min: clampShow('pass_ttl_min', 30, 1, 1440),
     verify_link_min:
       clampShow('verify_link_min', 10, 1, 120),
@@ -13203,7 +14770,9 @@ async function handleConfigApi(request, env) {
     userlist_sort:
       cfg('userlist_sort', 'active'),
     userlist_page_size:
-      clampShow('userlist_page_size', 20, 5, 100)
+      clampShow('userlist_page_size', 20, 5, 100),
+    display_tz:
+      cfg('display_tz', 'Asia/Singapore')
   });
 }
 
@@ -13214,7 +14783,7 @@ async function handleConfigSet(request, env) {
     return parsed.response;
   }
 
-  const { body } = parsed;
+  const { body, adminId } = parsed;
   const key = String(body?.key || '');
   const rawValue = Array.isArray(body?.value)
     ? body.value.map(String).join(',')
@@ -13223,16 +14792,74 @@ async function handleConfigSet(request, env) {
   const result = validateScalarConfig(key, rawValue);
 
   if (result.error) {
+    // 校验失败也留痕（只记键名，不记提交值）。
+    await writeAdminAudit(
+      env,
+      adminId,
+      'config_set',
+      key,
+      'failed',
+      'invalid'
+    );
+
     return Response.json(
       { ok: false, error: result.error },
       { status: 400 }
     );
   }
 
+  // 改配置是敏感动作：必须带管理台签发的一次性 nonce，
+  // 且绑定的就是这一对 {键, 提交值}，换值重放一律拒绝。
+  const nonceVerdict = await consumeActionNonce(env, {
+    nonce: body?.nonce,
+    adminId,
+    scope: 'panel',
+    action: 'config_set',
+    target: key,
+    params: { value: String(rawValue ?? '') }
+  });
+
+  if (nonceVerdict !== 'ok') {
+    await writeAdminAudit(
+      env,
+      adminId,
+      'config_set',
+      key,
+      'rejected',
+      `nonce_${nonceVerdict}`
+    );
+
+    return Response.json(
+      { ok: false, error: 'nonce_invalid' },
+      { status: 403 }
+    );
+  }
+
   await setConfig(key, result.value, env);
+
+  await writeAdminAudit(
+    env,
+    adminId,
+    'config_set',
+    key,
+    'ok'
+  );
 
   return Response.json({ ok: true });
 }
+
+// 转发过滤的八个开关键：开关接口与 nonce 签发的目标校验
+// 共用同一份名单。
+const FILTER_TOGGLE_KEYS = new Set([
+  'enable_image_forwarding',
+  'enable_link_forwarding',
+  'enable_text_forwarding',
+  'enable_audio_forwarding',
+  'enable_sticker_forwarding',
+  'enable_user_forwarding',
+  'enable_group_forwarding',
+  'enable_channel_forwarding'
+]);
 
 async function handleConfigToggle(request, env) {
   const parsed = await readPanelPostBody(request, env, 'panel');
@@ -13241,22 +14868,20 @@ async function handleConfigToggle(request, env) {
     return parsed.response;
   }
 
-  const { body } = parsed;
-
-  const allowedKeys = new Set([
-    'enable_image_forwarding',
-    'enable_link_forwarding',
-    'enable_text_forwarding',
-    'enable_audio_forwarding',
-    'enable_sticker_forwarding',
-    'enable_user_forwarding',
-    'enable_group_forwarding',
-    'enable_channel_forwarding'
-  ]);
+  const { body, adminId } = parsed;
 
   const key = String(body?.key || '');
 
-  if (!allowedKeys.has(key)) {
+  if (!FILTER_TOGGLE_KEYS.has(key)) {
+    await writeAdminAudit(
+      env,
+      adminId,
+      'config_toggle',
+      key,
+      'failed',
+      'invalid'
+    );
+
     return Response.json(
       { ok: false, error: '不允许的开关项' },
       { status: 400 }
@@ -13264,9 +14889,45 @@ async function handleConfigToggle(request, env) {
   }
 
   if (typeof body?.value !== 'boolean') {
+    await writeAdminAudit(
+      env,
+      adminId,
+      'config_toggle',
+      key,
+      'failed',
+      'invalid'
+    );
+
     return Response.json(
       { ok: false, error: '开关值无效' },
       { status: 400 }
+    );
+  }
+
+  // 开关切换也是改状态的敏感动作：与改配置同一套一次性
+  // nonce，绑 {键, 目标值}，复用 / 换值重放一律拒绝。
+  const nonceVerdict = await consumeActionNonce(env, {
+    nonce: body?.nonce,
+    adminId,
+    scope: 'panel',
+    action: 'config_toggle',
+    target: key,
+    params: { value: body.value === true }
+  });
+
+  if (nonceVerdict !== 'ok') {
+    await writeAdminAudit(
+      env,
+      adminId,
+      'config_toggle',
+      key,
+      'rejected',
+      `nonce_${nonceVerdict}`
+    );
+
+    return Response.json(
+      { ok: false, error: 'nonce_invalid' },
+      { status: 403 }
     );
   }
 
@@ -13274,6 +14935,14 @@ async function handleConfigToggle(request, env) {
     key,
     body.value ? 'true' : 'false',
     env
+  );
+
+  await writeAdminAudit(
+    env,
+    adminId,
+    'config_toggle',
+    key,
+    'ok'
   );
 
   return Response.json({ ok: true });
@@ -13289,6 +14958,38 @@ async function handleConfigPause(request, env) {
   const { body, adminId } = parsed;
   const action = String(body?.action || '');
 
+  // 熔断开关是改状态的敏感动作：与改配置同一套一次性
+  // nonce，绑 {操作, 开启时含分钟数}；校验失败照留痕。
+  const consumePauseNonce = async (params) => {
+    const verdict = await consumeActionNonce(env, {
+      nonce: body?.nonce,
+      adminId,
+      scope: 'panel',
+      action: 'config_pause',
+      target: action,
+      params
+    });
+
+    if (verdict !== 'ok') {
+      await writeAdminAudit(
+        env,
+        adminId,
+        'config_pause',
+        action,
+        'rejected',
+        `nonce_${verdict}`
+      );
+    }
+
+    return verdict === 'ok';
+  };
+
+  const nonceInvalidResponse = () =>
+    Response.json(
+      { ok: false, error: 'nonce_invalid' },
+      { status: 403 }
+    );
+
   if (action === 'pause') {
     const minutes = Number(body?.minutes);
 
@@ -13297,6 +14998,15 @@ async function handleConfigPause(request, env) {
       minutes < 1 ||
       minutes > PAUSE_MAX_MINUTES
     ) {
+      await writeAdminAudit(
+        env,
+        adminId,
+        'config_pause',
+        action,
+        'failed',
+        'invalid'
+      );
+
       return Response.json(
         {
           ok: false,
@@ -13306,7 +15016,24 @@ async function handleConfigPause(request, env) {
       );
     }
 
+    if (
+      !(await consumePauseNonce({
+        action: 'pause',
+        minutes
+      }))
+    ) {
+      return nonceInvalidResponse();
+    }
+
     const state = await performPause(env, minutes, adminId);
+
+    await writeAdminAudit(
+      env,
+      adminId,
+      'config_pause',
+      action,
+      'ok'
+    );
 
     return Response.json({
       ok: true,
@@ -13319,11 +15046,25 @@ async function handleConfigPause(request, env) {
   }
 
   if (action === 'resume') {
+    if (
+      !(await consumePauseNonce({ action: 'resume' }))
+    ) {
+      return nonceInvalidResponse();
+    }
+
     // 与命令路径对齐：没有进行中的熔断时短路，不执行
     // 恢复全流程，更不群发并未发生的「已恢复」通知。
     const state = await getPauseState(env);
 
     if (!state) {
+      await writeAdminAudit(
+        env,
+        adminId,
+        'config_pause',
+        action,
+        'ok'
+      );
+
       return Response.json({
         ok: true,
         pause_state: { active: false },
@@ -13333,11 +15074,28 @@ async function handleConfigPause(request, env) {
 
     await performResume(env, adminId);
 
+    await writeAdminAudit(
+      env,
+      adminId,
+      'config_pause',
+      action,
+      'ok'
+    );
+
     return Response.json({
       ok: true,
       pause_state: { active: false }
     });
   }
+
+  await writeAdminAudit(
+    env,
+    adminId,
+    'config_pause',
+    action,
+    'failed',
+    'invalid'
+  );
 
   return Response.json(
     { ok: false, error: '未知操作' },
@@ -13352,9 +15110,42 @@ async function handleConfigList(request, env) {
     return parsed.response;
   }
 
-  const { body } = parsed;
+  const { body, adminId } = parsed;
   const key = String(body?.key || '');
   const op = String(body?.op || '');
+
+  // 名单增删也是改状态的敏感动作：与改配置同一套一次性
+  // nonce，绑 {名单, 操作, 条目内容}（删除绑被删条目本
+  // 身，见 nonceSemanticParams 的 config_list 分支）。
+  const consumeListNonce = async (params) => {
+    const verdict = await consumeActionNonce(env, {
+      nonce: body?.nonce,
+      adminId,
+      scope: 'panel',
+      action: 'config_list',
+      target: key,
+      params
+    });
+
+    if (verdict !== 'ok') {
+      await writeAdminAudit(
+        env,
+        adminId,
+        'config_list',
+        key,
+        'rejected',
+        `nonce_${verdict}`
+      );
+    }
+
+    return verdict === 'ok';
+  };
+
+  const listNonceInvalid = () =>
+    Response.json(
+      { ok: false, error: 'nonce_invalid' },
+      { status: 403 }
+    );
 
   if (key === 'block_keywords') {
     const keywords = await getBlockKeywords(env);
@@ -13411,12 +15202,29 @@ async function handleConfigList(request, env) {
         );
       }
 
+      if (
+        !(await consumeListNonce({
+          op: 'add',
+          value
+        }))
+      ) {
+        return listNonceInvalid();
+      }
+
       keywords.push(value);
 
       await setConfig(
         'block_keywords',
         JSON.stringify(keywords),
         env
+      );
+
+      await writeAdminAudit(
+        env,
+        adminId,
+        'config_list',
+        key,
+        'ok'
       );
 
       return Response.json({ ok: true, keywords });
@@ -13436,12 +15244,29 @@ async function handleConfigList(request, env) {
         );
       }
 
+      if (
+        !(await consumeListNonce({
+          op: 'delete',
+          item: keywords[index]
+        }))
+      ) {
+        return listNonceInvalid();
+      }
+
       keywords.splice(index, 1);
 
       await setConfig(
         'block_keywords',
         JSON.stringify(keywords),
         env
+      );
+
+      await writeAdminAudit(
+        env,
+        adminId,
+        'config_list',
+        key,
+        'ok'
       );
 
       return Response.json({ ok: true, keywords });
@@ -13523,6 +15348,16 @@ async function handleConfigList(request, env) {
         );
       }
 
+      if (
+        !(await consumeListNonce({
+          op: 'add',
+          pattern,
+          response
+        }))
+      ) {
+        return listNonceInvalid();
+      }
+
       rules.push({
         id: randomId(),
         keywords: pattern,
@@ -13533,6 +15368,14 @@ async function handleConfigList(request, env) {
         'keyword_responses',
         JSON.stringify(rules),
         env
+      );
+
+      await writeAdminAudit(
+        env,
+        adminId,
+        'config_list',
+        key,
+        'ok'
       );
 
       return Response.json({
@@ -13555,12 +15398,29 @@ async function handleConfigList(request, env) {
         );
       }
 
+      if (
+        !(await consumeListNonce({
+          op: 'delete',
+          item: String(rules[index].id || '')
+        }))
+      ) {
+        return listNonceInvalid();
+      }
+
       rules.splice(index, 1);
 
       await setConfig(
         'keyword_responses',
         JSON.stringify(rules),
         env
+      );
+
+      await writeAdminAudit(
+        env,
+        adminId,
+        'config_list',
+        key,
+        'ok'
       );
 
       return Response.json({
@@ -13576,6 +15436,153 @@ async function handleConfigList(request, env) {
   );
 }
 
+async function handleNonceMint(request, env) {
+  // 与其余网页 POST 同口径：先过体积上限再读体；用途由
+  // 发起页面声明（列表页 usrlist / 管理台 panel），鉴权
+  // 沿用该页自身的签名与 scope。
+  if (
+    Number(
+      request.headers.get('content-length') || 0
+    ) > 16384
+  ) {
+    return Response.json(
+      { ok: false, error: 'too large' },
+      { status: 413 }
+    );
+  }
+
+  let body;
+
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json(
+      { ok: false, error: 'bad json' },
+      { status: 400 }
+    );
+  }
+
+  const scope =
+    body?.scope === 'panel' ? 'panel' : 'usrlist';
+
+  const adminId = await checkUserListAuth(
+    body?.u,
+    body?.e,
+    body?.s,
+    env,
+    scope
+  );
+
+  if (!adminId) {
+    return Response.json(
+      { ok: false, error: 'unauthorized' },
+      { status: 403 }
+    );
+  }
+
+  const action = String(body?.action || '');
+  const target = String(body?.target || '');
+
+  if (scope === 'panel') {
+    const panelNonceTargets = {
+      config_set: (t) => !!t,
+      config_toggle: (t) => FILTER_TOGGLE_KEYS.has(t),
+      config_pause: (t) =>
+        t === 'pause' || t === 'resume',
+      config_list: (t) =>
+        t === 'block_keywords' ||
+        t === 'keyword_responses'
+    };
+
+    if (
+      !panelNonceTargets[action] ||
+      !panelNonceTargets[action](target)
+    ) {
+      return Response.json(
+        { ok: false, error: 'bad action' },
+        { status: 400 }
+      );
+    }
+  } else if (
+    !LIST_SENSITIVE_ACTIONS.has(action) ||
+    !/^\d{1,20}$/.test(target)
+  ) {
+    return Response.json(
+      { ok: false, error: 'bad action' },
+      { status: 400 }
+    );
+  }
+
+  const nonce = await mintActionNonce(env, {
+    adminId,
+    scope,
+    action,
+    target,
+    params: body?.params
+  });
+
+  return Response.json({ ok: true, nonce });
+}
+
+async function handleRevokeLinks(request, env) {
+  const parsed =
+    await readPanelPostBody(request, env, 'panel');
+
+  if (parsed.response) {
+    return parsed.response;
+  }
+
+  const scope = String(parsed.body?.scope || '');
+
+  if (!['panel', 'usrlist', 'guide'].includes(scope)) {
+    return Response.json(
+      { ok: false, error: 'bad scope' },
+      { status: 400 }
+    );
+  }
+
+  const next = (await getLinkEpoch(env, scope)) + 1;
+
+  await dbConfigPut(
+    `linkepoch:${scope}`,
+    String(next),
+    env
+  );
+
+  await writeAdminAudit(
+    env,
+    parsed.adminId,
+    'revoke_links',
+    scope,
+    'ok',
+    `epoch=${next}`
+  );
+
+  return Response.json({ ok: true, scope, epoch: next });
+}
+
+async function handleAuditApi(request, env) {
+  const adminId =
+    await panelQueryAdminId(request, env, 'panel');
+
+  if (!adminId) {
+    return Response.json(
+      { ok: false, error: 'unauthorized' },
+      { status: 403 }
+    );
+  }
+
+  const result = await env.TG_BOT_DB.prepare(
+    'SELECT ts, admin_id, action, target, result, detail ' +
+      'FROM admin_audit ORDER BY ts DESC LIMIT 100'
+  ).all();
+
+  return Response.json({
+    ok: true,
+    rows: result?.results || []
+  });
+}
+
 async function handleUserListAction(request, env) {
   const parsed =
     await readPanelPostBody(request, env);
@@ -13585,6 +15592,7 @@ async function handleUserListAction(request, env) {
   }
 
   const body = parsed.body;
+  const adminId = parsed.adminId;
 
   const targetId = String(body?.userId || '');
   const action = String(body?.action || '');
@@ -13602,6 +15610,38 @@ async function handleUserListAction(request, env) {
       { status: 403 }
     );
   }
+
+  // 敏感动作（delete / pass / trust / block）执行前的一次性
+  // nonce 关口：绑定（管理员、动作、目标、语义参数）全一致
+  // 且未过期才消费放行；失败记审计并回拒，动作不执行。
+  const guardNonce = async (act, params) => {
+    const verdict = await consumeActionNonce(env, {
+      nonce: body?.nonce,
+      adminId,
+      scope: 'usrlist',
+      action: act,
+      target: targetId,
+      params
+    });
+
+    if (verdict !== 'ok') {
+      await writeAdminAudit(
+        env,
+        adminId,
+        act,
+        targetId,
+        'rejected',
+        `nonce_${verdict}`
+      );
+
+      return Response.json(
+        { ok: false, error: 'nonce_invalid' },
+        { status: 403 }
+      );
+    }
+
+    return null;
+  };
 
   if (action === 'reset') {
     // 合并口径：重置连带清放行，与清信任一起回到未信任
@@ -13629,6 +15669,15 @@ async function handleUserListAction(request, env) {
     const target = await dbUserGet(targetId, env);
 
     if (!target) {
+      await writeAdminAudit(
+        env,
+        adminId,
+        'trust',
+        targetId,
+        'failed',
+        'not_found'
+      );
+
       return Response.json(
         { ok: false, error: '访客记录不存在' },
         { status: 400 }
@@ -13636,10 +15685,25 @@ async function handleUserListAction(request, env) {
     }
 
     if (body?.trust === false) {
+      const ng = await guardNonce('trust', { trust: false });
+
+      if (ng) {
+        return ng;
+      }
+
       await dbUserUpdate(
         targetId,
         { is_trusted: 0, relay_exempt: 0 },
         env
+      );
+
+      await writeAdminAudit(
+        env,
+        adminId,
+        'trust',
+        targetId,
+        'ok',
+        'untrust'
       );
 
       return Response.json({ ok: true });
@@ -13648,6 +15712,15 @@ async function handleUserListAction(request, env) {
     // 授予类参数 fail-closed：只有明确的 true 才授予，
     // 缺失或类型不对一律参数错误，绝不默认授予。
     if (body?.trust !== true) {
+      await writeAdminAudit(
+        env,
+        adminId,
+        'trust',
+        targetId,
+        'failed',
+        'bad_param'
+      );
+
       return Response.json(
         { ok: false, error: '参数错误' },
         { status: 400 }
@@ -13655,6 +15728,15 @@ async function handleUserListAction(request, env) {
     }
 
     if (Number(target.is_blocked || 0) === 1) {
+      await writeAdminAudit(
+        env,
+        adminId,
+        'trust',
+        targetId,
+        'failed',
+        'blocked'
+      );
+
       return Response.json(
         {
           ok: false,
@@ -13667,13 +15749,34 @@ async function handleUserListAction(request, env) {
     // 已经是已验证状态时只补标记：不再重复发成功提示、
     // 也不顶掉既有的验证回执槽。
     if (target.user_state === USER_STATE.VERIFIED) {
+      const ng = await guardNonce('trust', { trust: true });
+
+      if (ng) {
+        return ng;
+      }
+
       await dbUserUpdate(
         targetId,
         { is_trusted: 1, relay_exempt: 1 },
         env
       );
 
+      await writeAdminAudit(
+        env,
+        adminId,
+        'trust',
+        targetId,
+        'ok',
+        'trust'
+      );
+
       return Response.json({ ok: true });
+    }
+
+    const ng = await guardNonce('trust', { trust: true });
+
+    if (ng) {
+      return ng;
     }
 
     // 设置即生效：直接置为已验证并按验证成功收尾，
@@ -13692,6 +15795,15 @@ async function handleUserListAction(request, env) {
 
     await sendVerifySuccessReceipt(env, targetId);
 
+    await writeAdminAudit(
+      env,
+      adminId,
+      'trust',
+      targetId,
+      'ok',
+      'trust'
+    );
+
     return Response.json({ ok: true });
   }
 
@@ -13699,9 +15811,24 @@ async function handleUserListAction(request, env) {
     // 与 /ban、/unban 及资料卡完全同口径（统一生效
     // 函数）：写标记并发在册的封禁/解封通知，不删话题。
     if (body?.block === false) {
+      const ng = await guardNonce('block', { block: false });
+
+      if (ng) {
+        return ng;
+      }
+
       // 解封连带清零关键词命中计数（防旧计数再命中
       // 一次即刻重封）。
       await applyBlockState(targetId, false, env);
+
+      await writeAdminAudit(
+        env,
+        adminId,
+        'block',
+        targetId,
+        'ok',
+        'unblock'
+      );
 
       return Response.json({ ok: true });
     }
@@ -13709,13 +15836,37 @@ async function handleUserListAction(request, env) {
     // 屏蔽参数 fail-closed：只有明确的 true 才屏蔽，
     // 缺失或类型不对一律参数错误。
     if (body?.block !== true) {
+      await writeAdminAudit(
+        env,
+        adminId,
+        'block',
+        targetId,
+        'failed',
+        'bad_param'
+      );
+
       return Response.json(
         { ok: false, error: '参数错误' },
         { status: 400 }
       );
     }
 
+    const ng = await guardNonce('block', { block: true });
+
+    if (ng) {
+      return ng;
+    }
+
     await applyBlockState(targetId, true, env);
+
+    await writeAdminAudit(
+      env,
+      adminId,
+      'block',
+      targetId,
+      'ok',
+      'block'
+    );
 
     return Response.json({ ok: true });
   }
@@ -13752,6 +15903,14 @@ async function handleUserListAction(request, env) {
   if (action === 'delete') {
     const withTopic = body?.deleteTopic === true;
 
+    const ng = await guardNonce('delete', {
+      deleteTopic: withTopic
+    });
+
+    if (ng) {
+      return ng;
+    }
+
     let wipe = null;
 
     if (withTopic) {
@@ -13770,6 +15929,15 @@ async function handleUserListAction(request, env) {
       env
     );
 
+    await writeAdminAudit(
+      env,
+      adminId,
+      'delete',
+      targetId,
+      'ok',
+      withTopic ? 'wipe' : 'record'
+    );
+
     return Response.json({ ok: true, wipe });
   }
 
@@ -13777,6 +15945,15 @@ async function handleUserListAction(request, env) {
     const target = await dbUserGetOrCreate(targetId, env);
 
     if (target.user_state === USER_STATE.VERIFIED) {
+      await writeAdminAudit(
+        env,
+        adminId,
+        'pass',
+        targetId,
+        'failed',
+        'verified'
+      );
+
       return Response.json(
         { ok: false, error: '对方已是已验证状态' },
         { status: 400 }
@@ -13784,6 +15961,15 @@ async function handleUserListAction(request, env) {
     }
 
     if (Number(target.is_blocked || 0) === 1) {
+      await writeAdminAudit(
+        env,
+        adminId,
+        'pass',
+        targetId,
+        'failed',
+        'blocked'
+      );
+
       return Response.json(
         { ok: false, error: '对方已被封禁，请先解封再发放' },
         { status: 400 }
@@ -13791,6 +15977,12 @@ async function handleUserListAction(request, env) {
     }
 
     const oldPass = await passRecordGet(targetId, env);
+
+    const ng = await guardNonce('pass', {});
+
+    if (ng) {
+      return ng;
+    }
 
     const exp = Date.now() + (await passLinkTtlMs(env));
     const nonce = randomId();
@@ -13845,6 +16037,15 @@ async function handleUserListAction(request, env) {
         await dbConfigDelete(`pass:${targetId}`, env);
       }
 
+      await writeAdminAudit(
+        env,
+        adminId,
+        'pass',
+        targetId,
+        'failed',
+        'send_failed'
+      );
+
       return Response.json(
         {
           ok: false,
@@ -13873,6 +16074,14 @@ async function handleUserListAction(request, env) {
     if (oldPass?.m) {
       await quietDeleteMessage(env, targetId, oldPass.m);
     }
+
+    await writeAdminAudit(
+      env,
+      adminId,
+      'pass',
+      targetId,
+      'ok'
+    );
 
     return Response.json({ ok: true, passExp: exp });
   }
@@ -13990,10 +16199,12 @@ function buildUserListPage() {
 <script>
 var qs = new URLSearchParams(location.search);
 var AUTH = { u: qs.get('u'), e: qs.get('e'), s: qs.get('s') };
-var all = [], filt = 'all', query = '', page = 1;
-var listTotal = 0, listTruncated = false;
+var rows = [], filt = 'all', query = '', sortMode = '';
+var listTotal = 0;
 var GROUP_C = '';
 var PAGE = 15;
+var booted = false;
+var curCursor = '', cursorStack = [], nextCursor = null;
 var LABEL = { verified: '已验证', pending_verification: '待验证', blocked: '已屏蔽' };
 var CLS = { verified: 'b-ok', pending_verification: 'b-pend', blocked: 'b-ban' };
 
@@ -14009,49 +16220,98 @@ function fmt(ts) {
   return new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false });
 }
 
-function visible() {
-  var list = all.filter(function (u) {
-    if (filt === 'verified' && u.state !== 'verified') return false;
-    if (filt === 'pending' && u.state !== 'pending_verification') return false;
-    if (filt === 'blocked' && u.state !== 'blocked') return false;
-    if (query) {
-      var hay = (u.name + ' @' + u.username + ' ' + u.id + ' ' + (u.note || '')).toLowerCase();
-      if (hay.indexOf(query) === -1) return false;
-    }
-    return true;
-  });
-  var s = document.getElementById('sort').value;
-  list.sort(function (a, b) {
-    if (s === 'new') return b.created_at - a.created_at;
-    if (s === 'old') return a.created_at - b.created_at;
-    return b.updated_at - a.updated_at;
-  });
-  return list;
+// 列表数据改由服务端游标分页 + 搜索 + 状态筛选：本页只
+// 管按当前游标取一页回来渲染。筛选/搜索/排序变化都回到
+// 第一页（清游标栈）重新取。
+function loadUsers() {
+  var params = new URLSearchParams(qs.toString());
+  params.set('state', filt);
+  if (query) params.set('q', query);
+  if (booted) {
+    params.set('sort', sortMode);
+    params.set('limit', PAGE);
+  }
+  if (curCursor) params.set('cursor', curCursor);
+  fetch('/api/users?' + params.toString())
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (!d.ok) {
+        document.getElementById('list').innerHTML = '<div class="empty">加载失败：无权访问或链接已过期，请回主菜单重新打开。</div>';
+        return;
+      }
+      rows = d.users;
+      listTotal = d.total || 0;
+      nextCursor = d.nextCursor || null;
+      GROUP_C = d.group || '';
+      if (!booted) {
+        booted = true;
+        if (d.uiDefaults) {
+          if (d.uiDefaults.pageSize) PAGE = d.uiDefaults.pageSize;
+          if (d.uiDefaults.sort) {
+            sortMode = d.uiDefaults.sort;
+            document.getElementById('sort').value = sortMode;
+          }
+        }
+      }
+      if (!rows.length && cursorStack.length) {
+        // 当前页被删空了：自动退回上一页。
+        curCursor = cursorStack.pop();
+        loadUsers();
+        return;
+      }
+      render();
+    })
+    .catch(function () {
+      document.getElementById('list').innerHTML = '<div class="empty">加载失败，请回主菜单重新打开。</div>';
+    });
 }
 
-var ERROR_TEXT = { unauthorized: '链接已过期，重新发送 /start 换新菜单', 'too large': '内容太长', 'bad json': '请求格式错误', 'bad userId': '参数错误' };
+function resetAndLoad() {
+  curCursor = '';
+  cursorStack = [];
+  loadUsers();
+}
+
+var ERROR_TEXT = { unauthorized: '链接已过期，重新发送 /start 换新菜单', 'too large': '内容太长', 'bad json': '请求格式错误', 'bad userId': '参数错误', nonce_invalid: '操作凭据已失效，请重试' };
 function translateError(d) {
   if (d && d.error && ERROR_TEXT[d.error]) d.error = ERROR_TEXT[d.error];
   return d;
 }
+var SENSITIVE_ACT = { delete: 1, pass: 1, trust: 1, block: 1 };
 function act(id, action, delTopic, note, extra) {
   var body = { u: AUTH.u, e: AUTH.e, s: AUTH.s, action: action, userId: id, deleteTopic: !!delTopic, note: note };
   if (extra) { for (var ek in extra) body[ek] = extra[ek]; }
-  return fetch('/api/users/action', {
+  function send() {
+    return fetch('/api/users/action', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (r) { return r.json(); }).then(translateError);
+  }
+  if (!SENSITIVE_ACT[action]) return send();
+  // 敏感动作先领一次性凭据：凭据绑 {动作, 目标, 语义参数}，
+  // 5 分钟内有效、用后即焚，领不到就不执行动作。
+  var params = {};
+  if (action === 'delete') params = { deleteTopic: !!delTopic };
+  if (action === 'trust') params = { trust: !!(extra && extra.trust) };
+  if (action === 'block') params = { block: !!(extra && extra.block) };
+  return fetch('/api/nonce', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body)
-  }).then(function (r) { return r.json(); }).then(translateError);
+    body: JSON.stringify({ u: AUTH.u, e: AUTH.e, s: AUTH.s, scope: 'usrlist', action: action, target: id, params: params })
+  }).then(function (r) { return r.json(); }).then(function (m) {
+    if (!m || !m.ok || !m.nonce) return { ok: false, error: (m && m.error) || '凭据签发失败' };
+    body.nonce = m.nonce;
+    return send();
+  });
 }
 
 function render() {
-  var list = visible();
-  var pages = Math.max(1, Math.ceil(list.length / PAGE));
-  if (page > pages) page = pages;
-  document.getElementById('cnt').textContent = '共 ' + list.length + ' 人' + (listTruncated ? '（仅显示最近活跃的 1000 人，全部共 ' + listTotal + ' 人）' : '');
-  document.getElementById('pinfo').textContent = page + ' / ' + pages + ' 页';
-  document.getElementById('prev').disabled = page <= 1;
-  document.getElementById('next').disabled = page >= pages;
+  var list = rows;
+  document.getElementById('cnt').textContent = '共 ' + listTotal + ' 人';
+  document.getElementById('pinfo').textContent = '第 ' + (cursorStack.length + 1) + ' 页' + (nextCursor ? ' · 还有更多' : '');
+  document.getElementById('prev').disabled = !cursorStack.length;
+  document.getElementById('next').disabled = !nextCursor;
   var box = document.getElementById('list');
   box.textContent = '';
   if (!list.length) {
@@ -14061,7 +16321,7 @@ function render() {
     box.appendChild(d);
     return;
   }
-  list.slice((page - 1) * PAGE, page * PAGE).forEach(function (u) {
+  list.forEach(function (u) {
     var card = document.createElement('div');
     card.className = 'card';
     var nm = document.createElement('div');
@@ -14236,13 +16496,13 @@ function render() {
     };
     cf.appendChild(mk('a', '仅删除记录', function () {
       act(u.id, 'delete', false).then(function (d) {
-        if (d.ok) { all = all.filter(function (x) { return x.id !== u.id; }); toast('已删除记录'); render(); }
+        if (d.ok) { toast('已删除记录'); loadUsers(); }
         else toast('操作失败：' + (d.error || ''));
       });
     }));
     cf.appendChild(mk('b', '连话题、私聊一起清空', function () {
       act(u.id, 'delete', true).then(function (d) {
-        if (d.ok) { all = all.filter(function (x) { return x.id !== u.id; }); toast(d.wipe ? ('已清空：私聊删除 ' + d.wipe.private.ok + ' 条' + (d.wipe.private.failed ? '，' + d.wipe.private.failed + ' 条超过 48 小时删不掉' : '') + '，话题与记录已删除') : '已删除记录与话题'); render(); }
+        if (d.ok) { toast(d.wipe ? ('已清空：私聊删除 ' + d.wipe.private.ok + ' 条' + (d.wipe.private.failed ? '，' + d.wipe.private.failed + ' 条超过 48 小时删不掉' : '') + '，话题与记录已删除') : '已删除记录与话题'); loadUsers(); }
         else toast('操作失败：' + (d.error || ''));
       });
     }));
@@ -14256,27 +16516,27 @@ function render() {
   });
 }
 
+var qTimer = 0;
 document.getElementById('q').addEventListener('input', function (e) {
-  query = e.target.value.trim().toLowerCase();
-  page = 1;
-  render();
+  var v = e.target.value.trim();
+  clearTimeout(qTimer);
+  qTimer = setTimeout(function () { query = v; resetAndLoad(); }, 300);
 });
 document.getElementById('chips').addEventListener('click', function (e) {
   if (!e.target.dataset || !e.target.dataset.f) return;
   filt = e.target.dataset.f;
   var cs = document.querySelectorAll('.chip');
   for (var i = 0; i < cs.length; i++) cs[i].className = 'chip' + (cs[i].dataset.f === filt ? ' on' : '');
-  page = 1;
-  render();
+  resetAndLoad();
   var order = ['all', 'verified', 'pending', 'blocked'];
   var ni = order.indexOf(filt);
   slideIn(document.getElementById('list'), ni >= prevFiltIdx ? 1 : -1);
   prevFiltIdx = ni;
   uScrollTop();
 });
-document.getElementById('sort').addEventListener('change', function () { page = 1; render(); uScrollTop(); });
-document.getElementById('prev').onclick = function () { if (page > 1) { page--; render(); uScrollTop(); } };
-document.getElementById('next').onclick = function () { page++; render(); uScrollTop(); };
+document.getElementById('sort').addEventListener('change', function () { sortMode = document.getElementById('sort').value; resetAndLoad(); uScrollTop(); });
+document.getElementById('prev').onclick = function () { if (cursorStack.length) { curCursor = cursorStack.pop(); loadUsers(); uScrollTop(); } };
+document.getElementById('next').onclick = function () { if (nextCursor) { cursorStack.push(curCursor); curCursor = nextCursor; loadUsers(); uScrollTop(); } };
 
 function showTab(which) {
   var isStats = which === 'stats';
@@ -14359,26 +16619,7 @@ fetch('/api/stats?' + qs.toString())
   })
   .catch(statsFail);
 
-fetch('/api/users?' + qs.toString())
-  .then(function (r) { return r.json(); })
-  .then(function (d) {
-    if (!d.ok) {
-      document.getElementById('list').innerHTML = '<div class="empty">加载失败：无权访问或链接已过期，请回主菜单重新打开。</div>';
-      return;
-    }
-    all = d.users;
-    listTotal = d.total || 0;
-    listTruncated = !!d.truncated;
-    GROUP_C = d.group || '';
-    if (d.uiDefaults) {
-      if (d.uiDefaults.pageSize) PAGE = d.uiDefaults.pageSize;
-      if (d.uiDefaults.sort) document.getElementById('sort').value = d.uiDefaults.sort;
-    }
-    render();
-  })
-  .catch(function () {
-    document.getElementById('list').innerHTML = '<div class="empty">加载失败，请回主菜单重新打开。</div>';
-  });
+loadUsers();
 var uPad = 0;
 function uFixPad() {
   var hd = document.getElementById('uhead');
@@ -14699,7 +16940,11 @@ async function performPause(env, minutes, byAdminId) {
   return state;
 }
 
-async function performResume(env, byAdminId) {
+async function performResume(
+  env,
+  byAdminId,
+  ctx = null
+) {
   // 先翻牌、翻完才清状态：分批翻（单批上限见
   // flipPauseCards），直到剩余为 0 才走 stopPause 清行。
   // 没翻完不清行：某批一张都没翻动（多半是持续性
@@ -14708,13 +16953,55 @@ async function performResume(env, byAdminId) {
   // 即刻按已恢复处理（读状态一律返回未熔断），后续每
   // 一次读状态又会续翻一批，直到翻完由读路径清行，
   // 残卡不会搁浅（见 getPauseState 的到期续翻）。
-  let flip = { remaining: 0, settled: 0 };
+  let flip = await flipPauseCards(env);
 
-  for (let pass = 0; pass < 20; pass += 1) {
-    flip = await flipPauseCards(env);
+  if (
+    flip.remaining > 0 &&
+    flip.settled > 0 &&
+    ctx?.waitUntil
+  ) {
+    // 有请求上下文时只同步翻第一批：剩余批次挂
+    // waitUntil 后台续翻（翻完清行），同步部分随即
+    // 走下面的「保留待续翻」分支收尾——状态行 until
+    // 改到过去、服务即刻按已恢复处理。后台万一没
+    // 翻完，读路径也会续翻，双保险。
+    ctx.waitUntil(
+      (async () => {
+        try {
+          let rest = flip;
 
-    if (flip.remaining <= 0 || flip.settled <= 0) {
-      break;
+          for (
+            let pass = 0;
+            pass < 19 &&
+            rest.remaining > 0 &&
+            rest.settled > 0;
+            pass += 1
+          ) {
+            rest = await flipPauseCards(env);
+          }
+
+          if (rest.remaining <= 0) {
+            await stopPause(env);
+          }
+        } catch (error) {
+          console.error(
+            '后台续翻熔断提示卡失败（读路径会续翻）：',
+            error?.message || error
+          );
+        }
+      })()
+    );
+  } else {
+    // 无请求上下文的调用方（如网页管理台）维持
+    // 同步翻完（连同上面第一批，总批数仍封顶 20）。
+    for (
+      let pass = 0;
+      pass < 19 &&
+      flip.remaining > 0 &&
+      flip.settled > 0;
+      pass += 1
+    ) {
+      flip = await flipPauseCards(env);
     }
   }
 
@@ -14960,30 +17247,132 @@ async function pauseGateDrops(update, env) {
   return true;
 }
 
+// Webhook 同步编排（at-least-once）：闸门 → 两阶段
+// claim → 同步处理 → 按结果落账。处理成功回 200；
+// 瞬时失败（含 RateLimitDeferred）回 500，Telegram
+// 重推后整条重新处理（中继靠意向行防重复复制）；
+// 同一条更新连续失败 3 次判死信：标完成、私聊告警
+// 全体主管理员、回 200 止住重推。闸门丢弃不占位、
+// 直接回 200，与旧语义一致。
+async function processWebhookUpdate(
+  update,
+  env,
+  origin,
+  ctx
+) {
+  // 闸门自身已有「读状态失败放行」的口径；这里再兜
+  // 一层：闸门异常按放行处理，绝不让熔断子系统抖动
+  // 吞掉正常更新（后续处理若撞上同一故障，自有失败
+  // 重推兜底）。
+  let dropped = false;
+
+  try {
+    dropped = await pauseGateDrops(update, env);
+  } catch (error) {
+    console.error(
+      '熔断闸门异常，按放行处理：',
+      error?.message || error
+    );
+  }
+
+  if (dropped) {
+    return 200;
+  }
+
+  const claim = await claimUpdateStart(
+    update?.update_id,
+    env
+  );
+
+  if (claim.mode === 'duplicate') {
+    console.log(
+      '忽略重复 Update：',
+      update?.update_id
+    );
+
+    return 200;
+  }
+
+  if (claim.mode === 'inflight') {
+    console.log(
+      'Update 正在处理中，忽略本次投递：',
+      update?.update_id
+    );
+
+    return 200;
+  }
+
+  try {
+    await handleUpdate(update, env, origin, ctx);
+  } catch (error) {
+    console.error(
+      '处理 Update 失败：',
+      error?.stack || error?.message || error
+    );
+
+    if (claim.mode !== 'process') {
+      return 500;
+    }
+
+    let dead = false;
+
+    try {
+      dead = await claimUpdateFailed(
+        update.update_id,
+        env,
+        claim.attempts
+      );
+    } catch (bookkeepingError) {
+      console.error(
+        '记录 Update 失败次数失败：',
+        bookkeepingError?.message || bookkeepingError
+      );
+    }
+
+    if (dead) {
+      const brief =
+        (error?.name && error.name !== 'Error'
+          ? `${error.name}：`
+          : '') +
+        String(error?.message || error).slice(0, 300);
+
+      await notifyPrimaryAdmins(
+        env,
+        '⚠️ 死信告警：一条 Telegram 更新连续处理失败 ' +
+        '3 次，已停止重试。\n' +
+        `update_id：${update.update_id}\n` +
+        `错误：${brief}`
+      );
+
+      return 200;
+    }
+
+    return 500;
+  }
+
+  if (claim.mode === 'process') {
+    try {
+      await claimUpdateDone(update.update_id, env);
+    } catch (error) {
+      // 处理已成功：落账失败不改判失败。占位行留在
+      // pending，超时后被重推接管或被清扫回收；中继
+      // 有意向行保护，不会重复复制。
+      console.error(
+        '标记 Update 处理完成失败：',
+        error?.message || error
+      );
+    }
+  }
+
+  return 200;
+}
+
 async function handleUpdate(
   update,
   env,
   origin = '',
   ctx = null
 ) {
-  if (await pauseGateDrops(update, env)) {
-    return;
-  }
-
-  const accepted = await claimUpdate(
-    update?.update_id,
-    env
-  );
-
-  if (!accepted) {
-    console.log(
-      '忽略重复 Update：',
-      update?.update_id
-    );
-
-    return;
-  }
-
   if (update.message) {
     if (
       update.message.chat.type ===
@@ -14992,7 +17381,8 @@ async function handleUpdate(
       await handlePrivateMessage(
         update.message,
         env,
-        origin
+        origin,
+        ctx
       );
     } else if (
       String(update.message.chat.id) ===
@@ -15049,11 +17439,21 @@ async function handleUpdate(
     return;
   }
 
+  if (update.chat_member) {
+    await handleGroupChatMember(
+      update.chat_member,
+      env
+    );
+
+    return;
+  }
+
   if (update.callback_query) {
     await handleCallbackQuery(
       update.callback_query,
       env,
-      origin
+      origin,
+      ctx
     );
   }
 }
@@ -15242,17 +17642,40 @@ export default {
       );
     }
 
-    if (request.method === 'GET') {
-      return new Response(
-        'Telegram Bot Worker is running.',
-        {
-          status: 200,
-          headers: {
-            'content-type':
-              'text/plain; charset=utf-8'
-          }
-        }
+    if (
+      request.method === 'POST' &&
+      requestUrl.pathname === '/api/nonce'
+    ) {
+      return handleNonceMint(
+        request,
+        env
       );
+    }
+
+    if (
+      request.method === 'POST' &&
+      requestUrl.pathname === '/api/config/revoke-links'
+    ) {
+      return handleRevokeLinks(
+        request,
+        env
+      );
+    }
+
+    if (
+      request.method === 'GET' &&
+      requestUrl.pathname === '/api/audit'
+    ) {
+      return handleAuditApi(
+        request,
+        env
+      );
+    }
+
+    if (request.method === 'GET') {
+      // 未匹配任何页面路由的 GET 一律 404 且不带字样，
+      // 不再回「Worker is running」横幅让扫描器确认存活。
+      return new Response(null, { status: 404 });
     }
 
     if (request.method !== 'POST') {
@@ -15267,13 +17690,23 @@ export default {
       );
     }
 
+    if (requestUrl.pathname !== '/webhook') {
+      // Webhook 只认固定路径 /webhook；其余 POST 路径
+      // （前面已定义的 /api/* 等路由不走这里）一律 404。
+      return new Response(null, { status: 404 });
+    }
+
     const webhookSecret = request.headers.get(
       'X-Telegram-Bot-Api-Secret-Token'
     );
 
     if (
       !webhookSecret ||
-      webhookSecret !== env.WEBHOOK_SECRET
+      !env.WEBHOOK_SECRET ||
+      !timingSafeEqualString(
+        webhookSecret,
+        env.WEBHOOK_SECRET
+      )
     ) {
       console.warn(
         '收到未通过 Webhook Secret 验证的请求。'
@@ -15305,23 +17738,27 @@ export default {
       );
     }
 
-    ctx.waitUntil(
-      handleUpdate(
+    // 同步处理（at-least-once）：处理完成才回响应，
+    // 瞬时失败回 500 让 Telegram 重推，编排细节见
+    // processWebhookUpdate。清理与更新检查仍走
+    // waitUntil 搭载，不占同步路径。
+    let updateStatus = 200;
+
+    try {
+      updateStatus = await processWebhookUpdate(
         update,
         env,
         requestUrl.origin,
         ctx
-      ).catch(
-        (error) => {
-          console.error(
-            '异步处理 Update 失败：',
-            error?.stack ||
-            error?.message ||
-            error
-          );
-        }
-      )
-    );
+      );
+    } catch (error) {
+      console.error(
+        '编排 Update 失败：',
+        error?.stack || error?.message || error
+      );
+
+      updateStatus = 500;
+    }
 
     if (Math.random() < 0.01) {
       ctx.waitUntil(
@@ -15335,12 +17772,17 @@ export default {
       );
     }
 
-    return new Response('OK', {
-      status: 200,
-      headers: {
-        'content-type':
-          'text/plain; charset=utf-8'
+    return new Response(
+      updateStatus === 200
+        ? 'OK'
+        : 'Processing Error',
+      {
+        status: updateStatus,
+        headers: {
+          'content-type':
+            'text/plain; charset=utf-8'
+        }
       }
-    });
+    );
   }
 };

@@ -4239,6 +4239,7 @@ async function relayUserMessageToTopic(
       userId,
       'receipt_msg_id'
     );
+    await clearTrackedStartMessage(env, userId);
   }
 
 }
@@ -6929,6 +6930,23 @@ async function voidUserPass(env, userId) {
   }
 }
 
+// 撤回记账中的访客 /start 并清记账行：验证成功收尾
+// （cleanupAfterVerified）与已验证访客首条真实消息的
+// 回执清理点共用。已验证访客再发 /start 时不会再有
+// 验证成功事件来消费这本账，故由回执清理连带撤回，
+// 口径与验证成功时一致（只记最新一条）。
+async function clearTrackedStartMessage(env, userId) {
+  const startMsgId = Number(
+    (await dbConfigGet(`startmsg:${userId}`, env)) || 0
+  );
+
+  if (startMsgId) {
+    await quietDeleteMessage(env, userId, startMsgId);
+  }
+
+  await dbConfigDelete(`startmsg:${userId}`, env);
+}
+
 // 任意入口验证通过后的联动清理：撤回验证提示；
 // 若还有未使用的通行证，一并删消息并作废（人已通过，证留着只是风险）；
 // 欢迎语与访客那条 /start 的使命也到此结束，一并撤回，
@@ -6950,15 +6968,7 @@ async function cleanupAfterVerified(env, userId) {
     'welcome_msg_id'
   );
 
-  const startMsgId = Number(
-    (await dbConfigGet(`startmsg:${userId}`, env)) || 0
-  );
-
-  if (startMsgId) {
-    await quietDeleteMessage(env, userId, startMsgId);
-  }
-
-  await dbConfigDelete(`startmsg:${userId}`, env);
+  await clearTrackedStartMessage(env, userId);
 
   // 答错计数与在途题目一并清：五条验证成功路径
   // （问答/顺序点击/Turnstile/通行证/设信任）都经
@@ -8496,6 +8506,18 @@ async function handlePrivateMessage(
         'receipt_msg_id',
         noticeSent?.message_id
       );
+      // 与未验证分支同口径记下这条 /start（只记最新一条，
+      // /help 不记）：已验证访客不会再有「验证成功收尾」
+      // 来撤它，改由首条真实消息的回执清理点连带撤回
+      // （见 clearTrackedStartMessage）。
+      if (commandText === '/start' && message.message_id) {
+        await dbConfigPut(
+          `startmsg:${userId}`,
+          String(message.message_id),
+          env
+        );
+      }
+
     } else {
       // 记下这条 /start 的编号（只记最新一条）：验证成功时
       // 连同欢迎语一并撤回（见 cleanupAfterVerified）。
@@ -8893,6 +8915,7 @@ async function handlePrivateMessage(
       userId,
       'receipt_msg_id'
     );
+    await clearTrackedStartMessage(env, userId);
   }
 
   const hitKeyword =

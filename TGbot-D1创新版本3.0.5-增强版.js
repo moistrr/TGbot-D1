@@ -42,7 +42,7 @@
  * 台（原按钮菜单已下线，旧按钮回迁移提示）；新手引导 /guide；
  * 自动检查更新；服务熔断 /pause /resume（手动触发，闸门在去重之
  * 前；到期惰性恢复——由到期后第一条更新触发解除并通知，属刻意
- * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应不拦、照常实时同步到对侧副本，避免恢复后两边记录不一致，也不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数；命令回执类话题通知（备注查看/保存/删除、重置验证、封禁/解封结果、资料卡重建、话题内熔断开启/恢复/状态结果、未识别命令）改为短暂显示，发出约 5 秒后自动删除；访客解除拉黑、发出 ✅ 提醒时，之前那条 🚫 拉黑提醒会被一并删掉（编号记在 blocknotice:<访客>）；话题里管理员发出的命令消息在处理后一并撤回（未识别的命令同样），只短暂留回执、不留命令原文；主菜单追踪记录带写入时间戳，超过 48 小时（记录里的消息号已过 Telegram 删除窗口）会被数据库清扫整行删掉，读到过期记录时也直接跳过注定失败的删除。第四轮审计修复：问答验证答错 5 次锁定 30 分钟防穷举；三页签名链接按用途分权（引导/列表/管理台互不通用），签名密钥可改用独立的 LINK_SECRET 与 webhook 校验值解耦（未配置时回退 WEBHOOK_SECRET）；整段对话清空仅主管理员可操作、确认防重复执行、访客记录已删时点确认不再把空档案建回来，且清空只删开始那一刻收集到的快照记录（清空期间新到的消息配对不受影响），提示行改分块批量查询与批量删除；拉黑提醒记账竞态收尾，删档与超时清理一并清记账；主菜单追踪清扫按值条件删防误删新鲜记录、原地编辑不再刷新追踪时间戳（时间戳只记消息号的出生时刻）、旧格式纯数字追踪恢复解析；话题被手动关闭时先重开原话题再投递、不再误判失效重建；转发失败（内容受保护等）会在话题里提醒、群权限丢失时改走主管理员私聊告警；已验证访客发送过频会被限流丢弃并提醒；反应同步补匿名管理员处理，付费/自定义 emoji 不再误清已镜像的普通反应；短暂通知落 ephem 记账，定时删除没赶上时由数据库清扫补删；菜单签名链接的来源地址改为随请求传递（去掉可被任意请求覆盖的全局变量）；以频道身份发帖等没有 from 的消息直接忽略、不再抛错；命令 @ 的机器人名不是本机器人时完全忽略；/note 保存失败时保留命令原文便于改了重发。定制化扩展：管理台「基础配置」含参数与开关（转发限流强度、通行证/验证链接有效期、问答锁定次数与时长、命令回执停留秒数可调，均带范围校验；功能开关含编辑提示——已拆为「访客编辑是否提醒我」「我编辑是否提醒访客」两项，外加反应同步、转发失败提醒、拉黑提醒），另有「文案与呈现」（验证成功/答错、熔断恢复、拉黑/解封五句文案可改；话题名四种样式；主菜单五个按钮逐个显隐；访客列表默认排序与每页条数存服务端配置）；按访客例外：信任开关（is_trusted 与 relay_exempt 已合并为一个概念、两标记同写同清：列表/资料卡设置即置已验证并按验证成功收尾，闸门处对未验证的信任访客自动放行，一并免转发限流与类型过滤、免两种超时清理，关键词屏蔽与自动封禁照常生效；重置验证与 /reverify 连带撤销，资料卡按钮仅主管理员），列表行带「🤝 已信任」徽标与切换按钮，/api/users 附 uiDefaults 供列表页套用默认排序与页大小。
+ * 设计；服务熔断回复每访客每轮最多一条，由新消息与按钮点击触发，被封禁者静默；管理台里关闭服务熔断回复时语句输入框自动隐藏；熔断期间访客新发的消息当场删除（私聊收到的消息 48 小时内可删，与 /delete 连带删除同一机制）；对熔断前已送达消息的编辑与反应同样拒收（编辑等于变相发新消息），被拒时每位访客每轮至多收到一张独立警告（pausewarn 记账、恢复时自动删除、文案可配，是否发送跟随熔断回复开关），不触发熔断回复；恢复服务时把每位访客那张「请稍后再试」原地翻成「✅ 服务已恢复」，该恢复提示会在访客下一次发消息时自动撤回）；主菜单只保留最新一对：删除推迟一轮，新菜单送达后删的是上一条菜单与触发它的 /start，最新一条 /start 始终保留在聊天里方便点按重发、刷新过期的网页链接（追踪存 config 的 mainmenu:<chatId>，JSON {m, c}）；三页 POST 出口带错误码翻译，unauthorized 显示为「链接已过期，重新发送 /start 换新菜单」，不再把英文错误码原样弹给管理员；整段对话清空：网页访客列表删除升级为「连话题、私聊一起清空」（连带批量删除访客私聊中的聊天副本），话题内 /clear 命令做同样的双边清空但保留话题与访客档案，均按 rxmap 配对批量删除、私聊侧受 48 小时限制、执行后报告实删与删不掉的条数；命令回执类话题通知（备注查看/保存/删除、重置验证、封禁/解封结果、资料卡重建、话题内熔断开启/恢复/状态结果、未识别命令）改为短暂显示，发出约 5 秒后自动删除；访客解除拉黑、发出 ✅ 提醒时，之前那条 🚫 拉黑提醒会被一并删掉（编号记在 blocknotice:<访客>）；话题里管理员发出的命令消息在处理后一并撤回（未识别的命令同样），只短暂留回执、不留命令原文；主菜单追踪记录带写入时间戳，超过 48 小时（记录里的消息号已过 Telegram 删除窗口）会被数据库清扫整行删掉，读到过期记录时也直接跳过注定失败的删除。第四轮审计修复：问答验证答错 5 次锁定 30 分钟防穷举；三页签名链接按用途分权（引导/列表/管理台互不通用），签名密钥可改用独立的 LINK_SECRET 与 webhook 校验值解耦（未配置时回退 WEBHOOK_SECRET）；整段对话清空仅主管理员可操作、确认防重复执行、访客记录已删时点确认不再把空档案建回来，且清空只删开始那一刻收集到的快照记录（清空期间新到的消息配对不受影响），提示行改分块批量查询与批量删除；拉黑提醒记账竞态收尾，删档与超时清理一并清记账；主菜单追踪清扫按值条件删防误删新鲜记录、原地编辑不再刷新追踪时间戳（时间戳只记消息号的出生时刻）、旧格式纯数字追踪恢复解析；话题被手动关闭时先重开原话题再投递、不再误判失效重建；转发失败（内容受保护等）会在话题里提醒、群权限丢失时改走主管理员私聊告警；已验证访客发送过频会被限流丢弃并提醒；反应同步补匿名管理员处理，付费/自定义 emoji 不再误清已镜像的普通反应；短暂通知落 ephem 记账，定时删除没赶上时由数据库清扫补删；菜单签名链接的来源地址改为随请求传递（去掉可被任意请求覆盖的全局变量）；以频道身份发帖等没有 from 的消息直接忽略、不再抛错；命令 @ 的机器人名不是本机器人时完全忽略；/note 保存失败时保留命令原文便于改了重发。定制化扩展：管理台「基础配置」含参数与开关（转发限流强度、通行证/验证链接有效期、问答锁定次数与时长、命令回执停留秒数可调，均带范围校验；功能开关含编辑提示——已拆为「访客编辑是否提醒我」「我编辑是否提醒访客」两项，外加反应同步、转发失败提醒、拉黑提醒），另有「文案与呈现」（验证成功/答错、熔断恢复、拉黑/解封五句文案可改；话题名四种样式；主菜单五个按钮逐个显隐；访客列表默认排序与每页条数存服务端配置）；按访客例外：信任开关（is_trusted 与 relay_exempt 已合并为一个概念、两标记同写同清：列表/资料卡设置即置已验证并按验证成功收尾，闸门处对未验证的信任访客自动放行，一并免转发限流与类型过滤、免两种超时清理，关键词屏蔽与自动封禁照常生效；重置验证与 /reverify 连带撤销，资料卡按钮仅主管理员），列表行带「🤝 已信任」徽标与切换按钮，/api/users 附 uiDefaults 供列表页套用默认排序与页大小。
  * 三页（指南 / 管理台 / 访客列表）约定
  * - 页眉 position:fixed + 脚本实测高度补偿 body padding-top，
  *   不要改回 sticky：iOS 上 sticky 在滚动中逐帧重定位会闪烁。
@@ -98,6 +98,8 @@ const DEFAULTS = {
     '🥺 抱歉，这次没有回答正确，请重新查看提示后再试。',
   pause_restored_text:
     '✅ 服务已恢复，可以正常发送消息了。',
+  pause_warn_text:
+    '编辑或贴反应转发失败，请稍后再试',
   block_notice_text:
     '🚫 对方已将机器人拉黑，后续消息将无法送达。',
   unblock_notice_text:
@@ -1387,6 +1389,16 @@ async function cleanupExpiredUsers(env, now) {
 
     await dbConfigDelete(
       `pausemsg:${userId}`,
+      env
+    );
+
+    await dbConfigDelete(
+      `pausewarn:${userId}`,
+      env
+    );
+
+    await dbConfigDelete(
+      `pauserestored:${userId}`,
       env
     );
 
@@ -4240,6 +4252,7 @@ async function relayUserMessageToTopic(
       'receipt_msg_id'
     );
     await clearTrackedStartMessage(env, userId);
+    await clearRestoredPauseCard(env, userId);
   }
 
 }
@@ -6947,6 +6960,25 @@ async function clearTrackedStartMessage(env, userId) {
   await dbConfigDelete(`startmsg:${userId}`, env);
 }
 
+// 撤回翻牌后的「✅ 服务已恢复」卡并清转记行：熔断恢复
+// 时 flipPauseCards 把翻牌成功的卡转记到
+// pauserestored:<uid>，访客下一次发消息时在两处回执
+// 清理点连带撤回，与验证成功回执同一口径——使命都是
+// 「通知访客状态已变更」，访客重新开口即视为已看到。
+// 访客再也不发消息时卡留存，与回执同一已知口径，
+// 不另做定时清理。
+async function clearRestoredPauseCard(env, userId) {
+  const restoredMsgId = Number(
+    (await dbConfigGet(`pauserestored:${userId}`, env)) || 0
+  );
+
+  if (restoredMsgId) {
+    await quietDeleteMessage(env, userId, restoredMsgId);
+  }
+
+  await dbConfigDelete(`pauserestored:${userId}`, env);
+}
+
 // 任意入口验证通过后的联动清理：撤回验证提示；
 // 若还有未使用的通行证，一并删消息并作废（人已通过，证留着只是风险）；
 // 欢迎语与访客那条 /start 的使命也到此结束，一并撤回，
@@ -8708,7 +8740,7 @@ async function handlePrivateMessage(
                 chat_id: chatId,
                 text:
                   `⏸ 服务熔断已开启，${describePauseRemaining(fresh)}。\n` +
-                  '暂停期间访客新发的消息会被删除（对已送达消息的编辑与反应照常同步）' +
+                  '暂停期间访客新发的消息会被删除（对已送达消息的编辑与反应同样拒收）' +
                   (replyOn
                     ? '，每位访客会收到一条回复提醒'
                     : '，且不会收到任何回复') +
@@ -8916,6 +8948,7 @@ async function handlePrivateMessage(
       'receipt_msg_id'
     );
     await clearTrackedStartMessage(env, userId);
+    await clearRestoredPauseCard(env, userId);
   }
 
   const hitKeyword =
@@ -12367,6 +12400,16 @@ async function purgeManagedUser(
   );
 
   await dbConfigDelete(
+    `pausewarn:${userId}`,
+    env
+  );
+
+  await dbConfigDelete(
+    `pauserestored:${userId}`,
+    env
+  );
+
+  await dbConfigDelete(
     `promptat:${userId}`,
     env
   );
@@ -12408,7 +12451,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.4.1';
+const BOT_VERSION = 'v1.4.2';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -12686,7 +12729,7 @@ async function handlePauseCallback(
       text:
         '⏸ <b>服务熔断</b>\n\n' +
         '选择暂停时长。暂停期间访客新发的消息' +
-        '会被删除（对已送达消息的编辑与反应照常同步，管理员不受影响），到期自动恢复，' +
+        '会被删除（对已送达消息的编辑与反应同样拒收，管理员不受影响），到期自动恢复，' +
         '也可随时在主菜单或用 /resume 提前恢复。\n' +
         'ℹ️ 到期不会立刻发通知：恢复通知会在到期后第一条消息到来时一并送达；没人发消息时收不到通知是正常的，服务熔断其实已经结束。',
       reply_markup: {
@@ -14270,7 +14313,7 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">拉黑有提醒：</b>访客把机器人拉黑时，他的话题里会出现 🚫 提醒；他取消拉黑时有 ✅ 提醒，不用你去猜他还在不在；发出 ✅ 提醒的同时，之前那条 🚫 提醒会被一并删掉，话题里只留最新状态。</li>
       <li><b class=\"k\">转发失败有提醒：</b>投票、位置、游戏这类本体转不过来的消息，会在话题里落一张占位卡、访客那边也会收到一句提示（见文末「不支持清单」）；其他复制失败会在话题里留一行 ⚠️ 提醒你留意；要是在群里手动关闭了某个话题，访客再发消息时机器人会先把话题重新打开再投递，不会另建新话题；访客短时间内发得太频繁时，超出部分会被限流丢弃，并在话题里提醒一次。</li>
       <li><b class=\"k\">命令回执不留痕：</b>你在话题里发出的命令消息，会在处理后立即被撤回；/note 的查看与保存、/notedelete、/reverify、/ban、/unban、/card 重建、话题里 /pause 与 /resume 的结果提示，还有打错命令时的「未识别的命令」提示，都是短暂显示，约 5 秒后自动删除，话题里不会堆积这类回执。例外：/note 保存失败（比如备注超长）时，命令原文会保留下来，方便你照着改短了重发。</li>
-      <li><b class=\"k\">被轰炸时先开启服务熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客新发的消息会被机器人当场删除、不补送——消息发出去就消失，就是还在暂停的信号；对熔断前已送达消息的编辑和反应照常同步到话题副本，两边记录保持一致；开启服务熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息；恢复服务时，那条「请稍后再试」会自动改成「✅ 服务已恢复」，访客一看便知（暂停期间收到这条回复的人很多时，会在恢复后的头几条消息里分批改完）。到期自动恢复（恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的），也可随时 <code>/resume</code> 提前恢复。</li>
+      <li><b class=\"k\">被轰炸时先开启服务熔断：</b>私聊发 <code>/pause 60</code> 暂停机器人 60 分钟（主菜单、网页管理台里也有开关），期间访客新发的消息会被机器人当场删除、不补送——消息发出去就消失，就是还在暂停的信号；对熔断前已送达消息的编辑和反应同样会被拒收、不再同步到话题副本（编辑能把旧消息整段换成新内容，放行等于绕过暂停发新消息）；开启服务熔断回复时，被拒的访客会收到一张警告，每位访客每轮暂停至多一张，恢复服务时警告会自动删除（关闭熔断回复时完全静默，警告也不发），被拒的编辑不会在恢复后补同步，记得提醒对方恢复后重新编辑或重发；这句警告可以在管理台「文案与呈现」里改成自己的说法；开启服务熔断回复时，每位访客会收到一条「请稍后再试」，恢复后记得提醒对方重发重要消息；恢复服务时，那条「请稍后再试」会自动改成「✅ 服务已恢复」，访客一看便知；这条恢复提示会在访客下一次发消息时自动撤回（暂停期间收到这条回复的人很多时，会在恢复后的头几条消息里分批改完）。到期自动恢复（恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的），也可随时 <code>/resume</code> 提前恢复。</li>
     </ul>
   </section>
 
@@ -14291,7 +14334,7 @@ function buildGuidePage(pageCtx = {}) {
     <div class=\"cmd\"><code>/testverify</code><div>拿一条验证页的测试链接，自己先体验一遍。</div></div>
     <div class=\"cmd\"><code>/version</code><div>查看当前版本，以及有没有新版本。</div></div>
     <div class=\"cmd\"><code>/panel</code><div>直接打开网页管理台（只有主管理员可用）。主菜单里关掉了管理台按钮时，也可以用这个命令临时打开。</div></div>
-    <div class=\"cmd\"><code>/pause 60</code><div>开启服务熔断，暂停机器人 60 分钟（不写数字 = 60 分钟，话题里也能发）：期间访客新发的消息会被删除、不送达（对已送达消息的编辑与反应照常同步），到期自动恢复。</div></div>
+    <div class=\"cmd\"><code>/pause 60</code><div>开启服务熔断，暂停机器人 60 分钟（不写数字 = 60 分钟，话题里也能发）：期间访客新发的消息会被删除、不送达（对已送达消息的编辑与反应同样拒收，开启熔断回复时被拒会发一张警告、恢复时自动删除），到期自动恢复。</div></div>
     <div class=\"cmd\"><code>/resume</code><div>立即恢复机器人服务（话题里也能发）。</div></div>
   </section>
 
@@ -14305,7 +14348,7 @@ function buildGuidePage(pageCtx = {}) {
       <li><b class=\"k\">自动回复：</b>访客的话包含某个词时，机器人自动回一句你预设的话（比如包含「价格」就自动回价目说明）。</li>
       <li><b class=\"k\">协管员：</b>把帮你接待的人的 Telegram 数字 ID 填进来（多个用逗号隔开）。协管员能在话题里回复、用命令、贴表情，但进不了网页管理台，也看不到访客列表；这一区还有一份「成员看门狗豁免名单」，把合法的其他机器人或账号 ID 填进去，它们进管理群时就不会触发成员告警。</li>
       <li><b class=\"k\">服务熔断：</b>被消息轰炸时在这里一键暂停机器人（或用 /pause 命令），可设定暂停时长、到期自动恢复；还能设置暂停期间给访客的回复语句，或关掉回复保持完全静默。</li>
-      <li><b class=\"k\">文案与呈现：</b>验证成功 / 答错、熔断恢复、拉黑 / 解封这几句机器人说的话，能改成你自己的口气；话题名的样式（备注在前还是名字在前、带不带 ID）、主菜单上显示哪些按钮、访客列表默认排序与每页条数、时间显示的时区（默认 Asia/Singapore），也都在这里。</li>
+      <li><b class=\"k\">文案与呈现：</b>验证成功 / 答错、熔断恢复、熔断编辑警告、拉黑 / 解封这几句机器人说的话，能改成你自己的口气；话题名的样式（备注在前还是名字在前、带不带 ID）、主菜单上显示哪些按钮、访客列表默认排序与每页条数、时间显示的时区（默认 Asia/Singapore），也都在这里。</li>
       <li><b class=\"k\">安全与审计：</b>网页链接万一泄露（截图、转发、浏览器历史都可能漏出去），可以在这里一键让访客列表 / 网页管理台 / 新手引导某一页的已发链接全部失效，再重新发送 /start 换新链接；谁在什么时候做过删除、发通行证、改配置这类敏感操作，这里也留有一份审计记录可查（保留 90 天）。吊销只影响网页链接，验证链接与一次性通行证不受影响；若怀疑签名密钥泄露，仅吊销不够，需要到 Cloudflare 换掉 LINK_SECRET（未设置时为 WEBHOOK_SECRET）并用新值重跑一次 setWebhook，旧签名才会全部作废。</li>
     </ul>
     <div class=\"tip\">管理台的网页链接 10 分钟过期；剩不到 2 分钟时，页面顶部会先亮一条横幅提醒；打开时、或者开着页面闲置超时后保存时，都会提示过期，重新发送 /start、在新主菜单上重新打开就行。</div>
@@ -14646,7 +14689,7 @@ function buildPanelPage(pageCtx = {}) {
     <textarea id="f_pausereply" rows="2"></textarea>
     <button class="save" data-k="pause_reply_text" data-t="f_pausereply">保存</button>
     </div>
-    <div class="hint">暂停期间访客新发的消息会被删除、不转发，恢复后不会补送，请提醒对方重发重要内容；对已送达消息的编辑与表情反应照常同步，两边记录保持一致。已被封禁的访客不会收到回复。暂停到期会自动恢复，也可随时恢复；到期时不会立刻发通知，恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的。</div>
+    <div class="hint">暂停期间访客新发的消息会被删除、不转发，恢复后不会补送，请提醒对方重发重要内容；对已送达消息的编辑与表情反应也会被拒收、不再同步，上面开启回复时，被拒的访客每轮至多收到一张警告（文案在「文案与呈现」里改），恢复服务时警告自动删除；关闭回复时完全静默，警告也不发。已被封禁的访客不会收到回复。暂停到期会自动恢复，也可随时恢复；到期时不会立刻发通知，恢复通知会在到期后第一条消息到来时一并送达，没人发消息时收不到通知是正常的。</div>
   </section>
   <section id="sec-style" hidden>
     <h2>🎨 文案与呈现</h2>
@@ -14659,6 +14702,9 @@ function buildPanelPage(pageCtx = {}) {
     <label>服务恢复提示（熔断恢复时，原暂停消息翻成这句）</label>
     <textarea id="s_restored" rows="2"></textarea>
     <button class="save" data-k="pause_restored_text" data-t="s_restored">保存</button>
+    <label>熔断编辑 / 反应警告（熔断期间访客编辑或贴反应被拒收时发出，恢复时自动删除；「服务熔断期间回复访客」关闭时不发）</label>
+    <textarea id="s_pausewarn" rows="2"></textarea>
+    <button class="save" data-k="pause_warn_text" data-t="s_pausewarn">保存</button>
     <label>拉黑提醒（发到访客的话题里）</label>
     <textarea id="s_block" rows="2"></textarea>
     <button class="save" data-k="block_notice_text" data-t="s_block">保存</button>
@@ -15042,6 +15088,7 @@ fetch('/api/config?' + qs.toString())
     setVal('s_vsuccess', d.verify_success_text || '');
     setVal('s_vwrong', d.quiz_wrong_text || '');
     setVal('s_restored', d.pause_restored_text || '');
+    setVal('s_pausewarn', d.pause_warn_text || '');
     setVal('s_block', d.block_notice_text || '');
     setVal('s_unblock', d.unblock_notice_text || '');
     setVal('s_title', d.topic_title_style || 'note_first');
@@ -15388,6 +15435,7 @@ function validateScalarConfig(key, rawValue) {
     verify_success_text: 300,
     quiz_wrong_text: 300,
     pause_restored_text: 300,
+    pause_warn_text: 300,
     block_notice_text: 300,
     unblock_notice_text: 300
   };
@@ -15765,6 +15813,8 @@ async function handleConfigApi(request, env) {
       cfgText('quiz_wrong_text'),
     pause_restored_text:
       cfgText('pause_restored_text'),
+    pause_warn_text:
+      cfgText('pause_warn_text'),
     block_notice_text:
       cfgText('block_notice_text'),
     unblock_notice_text:
@@ -18012,30 +18062,54 @@ async function stopPause(env) {
   await dbConfigDelete(PAUSE_STATE_KEY, env);
 }
 
-// 恢复服务时把每位访客那张「请稍后再试」原地编辑成
-// 已恢复确认。翻牌记录 pausemsg:<uid> = 提示消息编号，
-// 熔断回复发送成功时写入。逐张翻牌后才删对应记录，
-// 中途被打断可由下一次恢复续跑：牌被访客自行删掉、
-// 机器人被拉黑等都静默跳过。
-// 单次最多处理 limit 张（默认 10）：翻牌挂在读路径上
+// 恢复服务时收尾熔断期间留下的两类访客侧消息：
+// pausemsg:<uid> 记录的那张「请稍后再试」原地编辑成
+// 已恢复确认；pausewarn:<uid> 记录的编辑/反应警告
+// 直接删除。两类记录同一趟处理、共享单次上限，逐条
+// 处理后才删对应记录，中途被打断可由下一次恢复续跑：
+// 消息被访客自行删掉、机器人被拉黑等都静默跳过。
+// 翻牌成功的「✅ 服务已恢复」卡不无痕结算：编号先转记
+// 到 pauserestored:<uid> 再删 pausemsg 记录，由访客
+// 下一次发消息时随回执清理一并撤回（见
+// clearRestoredPauseCard），与验证成功回执同一口径；
+// 翻牌未成功（终局错误结算、卡已不存在等）不转记。
+// 单次最多处理 limit 条（默认 10）：收尾挂在读路径上
 // （惰性到期、闸门、菜单）内联执行，必须给单次请求
 // 留出正文处理的子请求预算；剩余记录保留，下一次
-// 触发继续翻。返回值 { remaining, settled }：本轮后
-// 剩余未翻数与本轮已处理（删记录）数；读取记录本身
+// 触发继续处理。返回值 { remaining, settled }：本轮后
+// 剩余未处理数与本轮已处理（删记录）数；读取记录本身
 // 失败时 remaining=-1（剩余未知），调用方不得据此
-// 认定已翻完而清熔断状态行。
+// 认定已处理完而清熔断状态行。
 async function flipPauseCards(env, limit = 10) {
   let rows = [];
 
   try {
-    const result = await env.TG_BOT_DB.prepare(
+    const msgResult = await env.TG_BOT_DB.prepare(
       'SELECT key, value FROM config ' +
         'WHERE key LIKE ?'
     )
       .bind('pausemsg:%')
       .all();
 
-    rows = result?.results || [];
+    const warnResult = await env.TG_BOT_DB.prepare(
+      'SELECT key, value FROM config ' +
+        'WHERE key LIKE ?'
+    )
+      .bind('pausewarn:%')
+      .all();
+
+    // 两类记录合并成一趟队列、共享单次上限：
+    // 翻牌在前、警告删除在后，顺序固定便于续跑判断。
+    rows = [
+      ...(msgResult?.results || []).map((row) => ({
+        ...row,
+        warn: false
+      })),
+      ...(warnResult?.results || []).map((row) => ({
+        ...row,
+        warn: true
+      }))
+    ];
   } catch (error) {
     console.error(
       '读取熔断提示记录失败：',
@@ -18066,7 +18140,11 @@ async function flipPauseCards(env, limit = 10) {
 
     const key = String(row.key || '');
 
-    const userId = key.slice('pausemsg:'.length);
+    const prefix = row.warn
+      ? 'pausewarn:'
+      : 'pausemsg:';
+
+    const userId = key.slice(prefix.length);
 
     const messageId = Number(row.value);
 
@@ -18078,29 +18156,62 @@ async function flipPauseCards(env, limit = 10) {
       continue;
     }
 
-    let editError = null;
+    let opError = null;
 
     try {
-      await telegramApi(
-        env.BOT_TOKEN,
-        'editMessageText',
-        {
-          chat_id: userId,
-          message_id: messageId,
-          text: restoredText
-        }
-      );
+      if (row.warn) {
+        // 警告不翻牌：恢复时直接删掉这条警告消息。
+        await telegramApi(
+          env.BOT_TOKEN,
+          'deleteMessage',
+          {
+            chat_id: userId,
+            message_id: messageId
+          }
+        );
+      } else {
+        await telegramApi(
+          env.BOT_TOKEN,
+          'editMessageText',
+          {
+            chat_id: userId,
+            message_id: messageId,
+            text: restoredText
+          }
+        );
+      }
     } catch (error) {
-      editError = error;
+      opError = error;
     }
 
-    // 记录在翻牌尝试之后才删：进程中途被打断时，没轮到的
-    // 记录还在，下一次恢复会续跑（已翻的编辑同文案无副作用）。
-    // 且只有翻成功、或失败是带 errorCode 的终局错误（消息
+    // 记录在处理尝试之后才删：进程中途被打断时，没轮到的
+    // 记录还在，下一次恢复会续跑（已翻的编辑同文案无副作用，
+    // 已删的警告再删只会得到终局错误、同列处理）。
+    // 且只有处理成功、或失败是带 errorCode 的终局错误（消息
     // 已删、被拉黑、已是恢复文案等）才删；无 errorCode 的
-    // 瞬时失败（网络抖动、子请求超限）保留记录下一次再翻，
-    // 否则访客端会永远留着「请稍后再试」。
-    if (!editError || editError.errorCode) {
+    // 瞬时失败（网络抖动、子请求超限）保留记录下一次再处理，
+    // 否则访客端会永远留着「请稍后再试」或警告。
+    if (!opError || opError.errorCode) {
+      if (!row.warn && !opError) {
+        // 翻牌成功：这张卡现在显示「✅ 服务已恢复」，
+        // 编号转记到 pauserestored:<uid>，等访客下一次
+        // 发消息时随回执清理撤回。转记失败只丢追踪
+        // （卡长留），不影响结算本身，与熔断回复编号
+        // 记账失败同一降级口径。
+        try {
+          await dbConfigPut(
+            `pauserestored:${userId}`,
+            String(messageId),
+            env
+          );
+        } catch (error) {
+          console.error(
+            '转记已恢复提示编号失败：',
+            error?.message || error
+          );
+        }
+      }
+
       await dbConfigDelete(key, env);
 
       settled += 1;
@@ -18289,9 +18400,77 @@ async function describePauseStateForPanel(env) {
   };
 }
 
+// 熔断期间访客编辑/贴反应被拒时的警告：独立于熔断回复
+// 的另一张卡，每位访客每轮熔断至多一张——pausewarn:<uid>
+// 存警告消息编号，行在即不再发（编辑、反应共用额度）；
+// 发送失败不记账，下一个触发点可重试。恢复时由
+// flipPauseCards 随收尾队列删除并清行。是否发送跟随
+// 熔断回复开关 pause_reply_enabled（与新消息回复同一
+// 读法）：关着时不发、也不记账，开关中途打开后同轮
+// 再被拒仍可发本轮第一张。全程包 try：警告只是附带
+// 通知，任何失败都不能影响闸门的拦截决定。
+async function maybeSendPauseWarn(env, userId) {
+  try {
+    const warnEnabled =
+      (await getConfig(
+        'pause_reply_enabled',
+        env,
+        'true'
+      )) === 'true';
+
+    if (!warnEnabled) {
+      return;
+    }
+
+    const key = `pausewarn:${userId}`;
+
+    const existing = await dbConfigGet(key, env);
+
+    if (existing) {
+      return;
+    }
+
+    const warnText = await textConfig(
+      'pause_warn_text',
+      env
+    );
+
+    const sent = await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: userId,
+        text: warnText
+      }
+    );
+
+    if (sent?.message_id) {
+      try {
+        await dbConfigPut(
+          key,
+          String(sent.message_id),
+          env
+        );
+      } catch (error) {
+        console.error(
+          '记录熔断警告编号失败：',
+          error?.message || error
+        );
+      }
+    }
+  } catch (error) {
+    console.error(
+      '发送熔断编辑/反应警告失败：',
+      error?.message || error
+    );
+  }
+}
+
 // 暂停闸门：置于去重之前。返回 true 表示这条更新应被丢弃。
-// 拦非管理员私聊的新消息与按钮；编辑与反应只过闸门
-// 检查、照常放行同步。管理员与管理群侧永远放行，
+// 拦非管理员私聊的新消息、按钮、编辑与反应；编辑与
+// 反应被拒时另发一张独立警告（每轮至多一张、跟随熔断
+// 回复开关，见 maybeSendPauseWarn）。管理员与管理群
+// 侧永远放行，
 // my_chat_member 等事件不拦。
 async function pauseGateDrops(update, env) {
   let actorId = '';
@@ -18366,18 +18545,37 @@ async function pauseGateDrops(update, env) {
     kind === 'edited_message' ||
     kind === 'reaction'
   ) {
-    // 熔断只拦新消息：对熔断前已送达消息的编辑与反应
-    // 照常同步到对侧副本，否则恢复后两边记录对不上，
-    // 且编辑内容只在事件到达时存在、事后无从补回。
-    // 这两类也不发熔断回复——动作已经生效，
-    // 再发「请稍后再试」会误导访客。
-    return false;
+    // 对已送达消息的编辑与反应同样拒收：编辑可以把
+    // 旧消息整段换成新内容，照常同步等于绕过熔断
+    // 发新消息。被拒内容不留存（不存正文原则），
+    // 恢复后不补同步——靠警告当场告知访客未送达。
+    // 被封禁访客保持全静默：只拦不发。封禁状态读取
+    // 失败时按未封禁发警告，拦截决定本身不变。
+    let blocked = false;
+
+    try {
+      const gateUser = await dbUserGet(actorId, env);
+
+      blocked = !!gateUser?.is_blocked;
+    } catch (error) {
+      console.error(
+        '熔断闸门读取访客封禁状态失败：',
+        error?.message || error
+      );
+    }
+
+    if (!blocked) {
+      await maybeSendPauseWarn(env, actorId);
+    }
+
+    return true;
   }
 
   if (kind === 'message') {
     // 熔断期间访客新发的消息当场删除：消息消失本身
-    // 就是「仍在熔断」的信号。编辑不走这里——已在
-    // 上方放行同步，删了反而会与话题副本对不上。
+    // 就是「仍在熔断」的信号。编辑与反应不走这里——
+    // 它们在上方已被拦下：不删访客的旧消息本体，
+    // 只是不再同步到话题副本。
     await quietDeleteMessage(
       env,
       update.message.chat.id,
@@ -18430,6 +18628,19 @@ async function pauseGateDrops(update, env) {
         // 记下这张「请稍后再试」的编号，
         // 恢复服务时原地翻牌成「✅ 服务已恢复」。
         if (sent?.message_id) {
+          // 新卡记账前先清上一轮残留的「✅ 服务已恢复」
+          // 卡（若有）：状态相反的两张卡不能并存。清
+          // 失败不影响新卡记账，残留卡仍可由访客下一
+          // 条消息的回执清理点消费。
+          try {
+            await clearRestoredPauseCard(env, actorId);
+          } catch (error) {
+            console.error(
+              '清理残留已恢复提示失败：',
+              error?.message || error
+            );
+          }
+
           try {
             await dbConfigPut(
               `pausemsg:${actorId}`,

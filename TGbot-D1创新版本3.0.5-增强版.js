@@ -2453,10 +2453,6 @@ function getInfoCardButtons(
     ],
     [
       {
-        text: '📌 置顶资料卡',
-        callback_data: `pin_card:${userId}`
-      },
-      {
         text: '🔄 刷新资料卡',
         callback_data:
           `refresh_card:${userId}`
@@ -10118,7 +10114,6 @@ async function handleUserCardCallback(
   const allowedActions = new Set([
     'block',
     'unblock',
-    'pin_card',
     'refresh_card',
     'trust',
     'untrust'
@@ -10263,46 +10258,6 @@ async function handleUserCardCallback(
         ? '🤝 已设为信任，该访客已通过验证。'
         : '↩️ 已取消信任（当前验证状态不变）。'
     );
-
-    return;
-  }
-
-  if (action === 'pin_card') {
-    try {
-      await telegramApi(
-        env.BOT_TOKEN,
-        'pinChatMessage',
-        {
-          chat_id: message.chat.id,
-          message_id:
-            message.message_id,
-          disable_notification: true
-        }
-      );
-
-      await dbUserUpdate(
-        targetUserId,
-        {
-          info_card_message_id:
-            String(message.message_id)
-        },
-        env
-      );
-
-      await answerCallback(
-        callbackQuery.id,
-        env,
-        '✅ 已置顶资料卡。'
-      );
-    } catch (error) {
-      await answerCallback(
-        callbackQuery.id,
-        env,
-        `❌ 置顶失败：` +
-        `${error?.message || error}`,
-        true
-      );
-    }
 
     return;
   }
@@ -13318,7 +13273,7 @@ function buildGuidePage() {
   <section id=\"g-chat\">
     <h2>💬 接待日常</h2>
     <ul>
-      <li><b class=\"k\">资料卡：</b>每个话题顶部都钉着访客的资料卡（名字、ID、状态、你的备注）。卡片不见了就在话题里发 <code>/card</code> 重新生成；卡片上的按钮可以直接屏蔽 / 解除屏蔽、设为信任、置顶、刷新。</li>
+      <li><b class=\"k\">资料卡：</b>每个话题顶部都钉着访客的资料卡（名字、ID、状态、你的备注）。卡片不见了就在话题里发 <code>/card</code> 重新生成；卡片上的按钮可以直接屏蔽 / 解除屏蔽、设为信任、刷新。</li>
       <li><b class=\"k\">引用回复会跟着走：</b>你在话题里引用某条消息再回复，访客那边看到的也是引用着他原话的回复；访客引用着回复你时同理，连他框选一小段文字的「部分引用」都会原样带过去。</li>
       <li><b class=\"k\">改错字会同步：</b>直接编辑你已发送的消息，对方那边会同步改好，旁边出现一行「✍🏼已编辑」的小提示，提示下还挂着一颗「系统提示」按钮：按钮只有机器人能给消息挂上，访客自己发的消息带不了，所以同文案、没按钮的就是仿冒的，不用理会。Telegram 不给机器人提供官方的「已编辑」标记，这行提示就是补这个用的；访客编辑他的消息时，你这边也一样。两个方向的提示可以在管理台里分别开关：「访客编辑是否提醒我」与「我编辑是否提醒访客」。</li>
       <li><b class=\"k\">删消息两边一起删：</b>在话题里回复选中要删的那条消息，再发 <code>/delete</code>，两边同时删除。注意：访客私聊那边的原消息只能删 48 小时以内的，超了删不掉时会在话题里留一行说明。</li>

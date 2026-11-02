@@ -25,7 +25,7 @@
  *   已发链接全部失效；删除、发证、改配置等敏感操作另带一次性凭
  *   证（绑管理员、动作与参数），管理操作记审计日志（保留 90 天）。
  * - Webhook 改同步处理：成功才回 200，失败回 500 由 Telegram
- *   重推；同一更新连失败 3 次转死信告警；中继复制前先落意向行，
+ *   重推；同一更新连失败 3 次转死信告警（限流延迟不计入次数）；中继复制前先落意向行，
  *   重推不重复投递。
  * - D1 不存消息正文：只存转发配对（rxmap）、状态与备注；配对类记
  *   录 90 天清理；verified_ttl_days 到期删访客行与话题映射，回来
@@ -75,6 +75,7 @@ const DEFAULTS = {
   pause_reply_enabled: 'true',
   pause_reply_text: '请稍后再试',
   authorized_admins: '[]',
+  member_allow_ids: '[]',
 
   relay_burst: '30',
   relay_refill_per_sec: '5',
@@ -127,6 +128,7 @@ const LIMITS = {
   verif_q: 4000,
   verif_a: 300,
   authorized_admins: 2000,
+  member_allow_ids: 2000,
   block_keyword: 200,
   pause_reply_text: 500,
   auto_reply_pattern: 200,
@@ -145,6 +147,8 @@ const USER_UPDATE_FIELDS = new Set([
   'topic_id',
   'info_card_message_id',
   'user_info_json',
+  'search_name',
+  'search_username',
   'admin_note',
   'verify_prompt_msg_id',
   'receipt_msg_id',
@@ -746,6 +750,39 @@ async function ensureUserColumn(
   }
 }
 
+async function ensureAuditColumn(
+  env,
+  columnName,
+  definition
+) {
+  const result = await env.TG_BOT_DB.prepare(
+    'PRAGMA table_info(admin_audit)'
+  ).all();
+
+  const columns = result?.results || [];
+  const exists = columns.some(
+    (column) => column.name === columnName
+  );
+
+  if (!exists) {
+    try {
+      await env.TG_BOT_DB.prepare(
+        `ALTER TABLE admin_audit ADD COLUMN ` +
+        `${columnName} ${definition}`
+      ).run();
+    } catch (error) {
+      // 多个实例并发迁移时，后到者会撞上「列已存在」，视为成功。
+      if (
+        !String(error?.message || error).includes(
+          'duplicate column'
+        )
+      ) {
+        throw error;
+      }
+    }
+  }
+}
+
 async function ensureProcessedColumn(
   env,
   columnName,
@@ -914,6 +951,30 @@ async function dbMigrate(env) {
     env,
     'relay_exempt',
     'INTEGER NOT NULL DEFAULT 0'
+  );
+
+  await ensureUserColumn(
+    env,
+    'search_name',
+    'TEXT'
+  );
+
+  await ensureUserColumn(
+    env,
+    'search_username',
+    'TEXT'
+  );
+
+  await ensureAuditColumn(
+    env,
+    'epoch',
+    'TEXT'
+  );
+
+  await ensureAuditColumn(
+    env,
+    'ip',
+    'TEXT'
   );
 
   await ensureProcessedColumn(
@@ -1530,6 +1591,177 @@ async function claimUpdateFailed(
   return false;
 }
 
+// 限流延迟（RateLimitDeferred）不是处理失败：把占位置为
+// failed 释放（attempts 不累计），回 500 等 Telegram 在限
+// 流窗口过后重推，消息不进死信计数。
+async function claimUpdateRelease(updateId, env) {
+  if (
+    updateId === null ||
+    updateId === undefined
+  ) {
+    return;
+  }
+
+  await env.TG_BOT_DB.prepare(
+    "UPDATE processed_updates SET status = 'failed' " +
+    'WHERE update_id = ?'
+  ).bind(String(updateId)).run();
+}
+
+// 限流提示：每小时至多一条（config 时间戳节流），免得限流
+// 期间每条重推都刷一条告警。
+async function alertAdminsRateLimited(env) {
+  try {
+    const last = Number(
+      (await dbConfigGet(
+        'alertat:ratelimit',
+        env
+      )) || 0
+    );
+
+    if (Date.now() - last < 60 * 60 * 1000) {
+      return;
+    }
+
+    await dbConfigPut(
+      'alertat:ratelimit',
+      String(Date.now()),
+      env
+    );
+
+    await notifyPrimaryAdmins(
+      env,
+      '⏳ 机器人正被 Telegram 限流，部分消息将延迟送达，' +
+      '重推成功后无需处理。'
+    );
+  } catch (error) {
+    console.error(
+      '发送限流提示失败：',
+      error?.message || error
+    );
+  }
+}
+
+// 死信告警的上下文摘要：从 update 本体提取来源、发送者、
+// 聊天与内容种类，管理员收到告警能定位是谁的什么消息。
+// 拿不到的字段整项省略；整体 try 包裹——告警路径自身
+// 绝不能成为新的失败源。
+function summarizeUpdateForAlert(update) {
+  try {
+    const lines = [];
+
+    const kindOf = (m) => {
+      if (!m) return '';
+
+      if (m.text) return '文本';
+      if (m.photo) return '图片';
+      if (m.video) return '视频';
+      if (m.video_note) return '圆视频';
+      if (m.voice) return '语音';
+      if (m.audio) return '音频';
+      if (m.document) return '文件';
+      if (m.sticker) return '贴纸';
+      if (m.animation) return '动图';
+      if (m.poll) return '投票';
+      if (m.location) return '位置';
+      if (m.venue) return '地点';
+      if (m.contact) return '联系人名片';
+      if (m.game) return '游戏';
+      if (m.invoice) return '发票';
+      if (m.dice) return '骰子动画';
+      if (m.caption) return '带说明的媒体';
+
+      return '其他';
+    };
+
+    const senderOf = (user) => {
+      if (!user || user.id == null) return '';
+
+      const name = [user.first_name, user.last_name]
+        .filter(Boolean)
+        .join(' ')
+        .trim();
+
+      return (
+        '发送者：' +
+        (name ? `${escapeHtml(name)}，` : '') +
+        `ID ${user.id}`
+      );
+    };
+
+    const pushMessage = (label, m) => {
+      lines.push(`来源：${label}`);
+
+      const sender = senderOf(m?.from);
+
+      if (sender) lines.push(sender);
+
+      if (m?.chat?.id != null) {
+        lines.push(`聊天 ID：${m.chat.id}`);
+      }
+
+      const kind = kindOf(m);
+
+      if (kind) lines.push(`内容：${kind}`);
+    };
+
+    if (update?.message) {
+      pushMessage(
+        update.message.chat?.type === 'private'
+          ? '私聊消息'
+          : '管理群话题消息',
+        update.message
+      );
+    } else if (update?.edited_message) {
+      pushMessage('编辑消息', update.edited_message);
+    } else if (update?.message_reaction) {
+      lines.push('来源：表情反应');
+
+      const sender = senderOf(
+        update.message_reaction.user
+      );
+
+      if (sender) lines.push(sender);
+
+      if (update.message_reaction.chat?.id != null) {
+        lines.push(
+          `聊天 ID：${update.message_reaction.chat.id}`
+        );
+      }
+    } else if (update?.callback_query) {
+      lines.push('来源：按钮回调');
+
+      const sender = senderOf(update.callback_query.from);
+
+      if (sender) lines.push(sender);
+
+      if (
+        update.callback_query.message?.chat?.id != null
+      ) {
+        lines.push(
+          `聊天 ID：${update.callback_query.message.chat.id}`
+        );
+      }
+    } else if (
+      update?.my_chat_member ||
+      update?.chat_member
+    ) {
+      const cm =
+        update.my_chat_member || update.chat_member;
+
+      lines.push('来源：成员变动');
+
+      if (cm?.chat?.id != null) {
+        lines.push(`聊天 ID：${cm.chat.id}`);
+      }
+    }
+
+    return lines;
+  } catch (_) {
+    return [];
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /*                               配置数据库操作                                  */
 /* -------------------------------------------------------------------------- */
@@ -1655,6 +1887,47 @@ async function dbUserGet(userId, env) {
   return normalizeUser(row);
 }
 
+// 从 Telegram user 对象派生列表搜索字段：姓名拼接与
+// 用户名都小写化存储，搜索时 pattern 同样小写化，两边
+// 口径一致（不再对 user_info_json 原文做 LIKE）。
+function deriveUserSearchFields(userInfo) {
+  if (!userInfo || typeof userInfo !== 'object') {
+    return { name: '', username: '' };
+  }
+
+  const name = String(
+    userInfo.name ||
+    [userInfo.first_name, userInfo.last_name]
+      .filter(Boolean)
+      .join(' ') ||
+    ''
+  )
+    .trim()
+    .toLowerCase();
+
+  // 用户名以 username_raw 为准（资料卡落库的真名）；
+  // 没有时回退 username，但只接受像真名的（原始 from
+  // 对象的 username 本就是真名；资料卡的 username 是
+  // '@…' 展示串、甚至可能是「无用户名」占位，不能当
+  // 真名存）。
+  let username = String(userInfo.username_raw || '')
+    .replace(/^@+/, '')
+    .trim()
+    .toLowerCase();
+
+  if (!username) {
+    const candidate = String(userInfo.username || '')
+      .replace(/^@+/, '')
+      .trim();
+
+    if (/^[A-Za-z0-9_]+$/.test(candidate)) {
+      username = candidate.toLowerCase();
+    }
+  }
+
+  return { name, username };
+}
+
 async function dbUserGetOrCreate(userId, env) {
   const normalizedId = String(userId);
   const now = Math.floor(Date.now() / 1000);
@@ -1699,7 +1972,23 @@ async function dbUserUpdate(userId, data, env) {
         ? null
         : JSON.stringify(payload.user_info);
 
+    // 搜索字段与资料同写：姓名/用户名落成独立小写列，
+    // 列表搜索查列不查 JSON 原文（键名误命中、转义对
+    // 不上的毛病都出在原文 LIKE 上）。
+    const derived =
+      deriveUserSearchFields(payload.user_info);
+
+    payload.search_name = derived.name;
+    payload.search_username = derived.username;
+
     delete payload.user_info;
+  } else if (payload.user_info_json !== undefined) {
+    const derived = deriveUserSearchFields(
+      safeJsonParse(payload.user_info_json, null)
+    );
+
+    payload.search_name = derived.name;
+    payload.search_username = derived.username;
   }
 
   const keys = Object.keys(payload).filter(
@@ -3370,6 +3659,200 @@ async function notifyVisitorUnsupported(message, env) {
   }
 }
 
+// 占位卡的内容摘要：本体复制失败不等于内容不可见——
+// update 里本来就带着投票问题与选项、位置经纬度、名片
+// 姓名电话等明文字段，用文字转述给管理员，免得只剩一
+// 个类型标签、两边认知对不上。纯文本拼装（不依赖
+// parse_mode），字段缺失整项跳过；测验题绝不输出正确
+// 答案（那等于泄题），只标注「测验题」。
+const ZERO_DECIMAL_CURRENCIES = new Set([
+  'JPY', 'KRW', 'VND', 'CLP', 'PYG', 'UGX', 'ISK',
+  'XAF', 'XOF', 'XPF'
+]);
+
+function truncateForSummary(text, max) {
+  const chars = [...String(text ?? '')];
+
+  if (chars.length <= max) {
+    return chars.join('');
+  }
+
+  return chars.slice(0, max).join('') + '…';
+}
+
+function buildUnsupportedSummary(message) {
+  try {
+    const lines = [];
+
+    if (message?.poll) {
+      const poll = message.poll;
+
+      if (poll.question) {
+        lines.push(
+          `问题：${truncateForSummary(poll.question, 300)}`
+        );
+      }
+
+      const options = Array.isArray(poll.options)
+        ? poll.options
+        : [];
+
+      for (const option of options.slice(0, 10)) {
+        if (option?.text) {
+          lines.push(
+            `· ${truncateForSummary(option.text, 100)}`
+          );
+        }
+      }
+
+      const marks = [];
+
+      if (
+        poll.type === 'quiz' ||
+        poll.correct_option_id != null
+      ) {
+        marks.push('测验题');
+      }
+
+      if (poll.allows_multiple_answers) {
+        marks.push('可多选');
+      }
+
+      if (marks.length) {
+        lines.push(`（${marks.join('、')}）`);
+      }
+    } else if (message?.location) {
+      const loc = message.location;
+
+      if (loc.latitude != null && loc.longitude != null) {
+        lines.push(
+          `经纬度：${loc.latitude}, ${loc.longitude}`
+        );
+        lines.push(
+          '地图：https://www.google.com/maps?q=' +
+          `${loc.latitude},${loc.longitude}`
+        );
+      }
+
+      if (loc.live_period) {
+        const seconds = Number(loc.live_period);
+
+        lines.push(
+          '实时位置，约 ' +
+          (seconds >= 60
+            ? `${Math.round(seconds / 60)} 分钟`
+            : `${seconds} 秒`)
+        );
+      }
+    } else if (message?.venue) {
+      const venue = message.venue;
+
+      if (venue.title) {
+        lines.push(
+          `地点：${truncateForSummary(venue.title, 300)}`
+        );
+      }
+
+      if (venue.address) {
+        lines.push(
+          `地址：${truncateForSummary(venue.address, 300)}`
+        );
+      }
+
+      if (
+        venue.location?.latitude != null &&
+        venue.location?.longitude != null
+      ) {
+        lines.push(
+          `经纬度：${venue.location.latitude}, ` +
+          `${venue.location.longitude}`
+        );
+      }
+    } else if (message?.contact) {
+      const contact = message.contact;
+      const name = [
+        contact.first_name,
+        contact.last_name
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .trim();
+
+      if (name) {
+        lines.push(`姓名：${truncateForSummary(name, 300)}`);
+      }
+
+      if (contact.phone_number) {
+        lines.push(`电话：${contact.phone_number}`);
+      }
+    } else if (message?.game) {
+      const title =
+        message.game.title || message.game_short_name;
+
+      if (title) {
+        lines.push(
+          `游戏：${truncateForSummary(title, 300)}`
+        );
+      }
+    } else if (message?.invoice) {
+      const invoice = message.invoice;
+
+      if (invoice.title) {
+        lines.push(
+          `项目：${truncateForSummary(invoice.title, 300)}`
+        );
+      }
+
+      if (invoice.description) {
+        lines.push(
+          `说明：${truncateForSummary(invoice.description, 500)}`
+        );
+      }
+
+      if (invoice.total_amount != null) {
+        const amount = Number(invoice.total_amount);
+        const currency = String(invoice.currency || '');
+
+        if (
+          ZERO_DECIMAL_CURRENCIES.has(
+            currency.toUpperCase()
+          )
+        ) {
+          lines.push(
+            `金额：${amount} ${currency}（最小单位）`
+          );
+        } else {
+          const major = amount / 100;
+
+          lines.push(
+            '金额：' +
+            (Number.isInteger(major)
+              ? String(major)
+              : major.toFixed(2)) +
+            (currency ? ` ${currency}` : '')
+          );
+        }
+      }
+    } else if (message?.dice) {
+      lines.push(
+        `${message.dice.emoji || '🎲'} 点数：` +
+        `${message.dice.value ?? ''}`
+      );
+    }
+
+    const summary = lines.join('\n');
+    const chars = [...summary];
+
+    if (chars.length > 1200) {
+      return chars.slice(0, 1200).join('') + '…';
+    }
+
+    return summary;
+  } catch (_) {
+    return '';
+  }
+}
+
 // 本体复制失败且属于特殊类型 / 受保护内容时，在话题里
 // 落一张占位卡代替原失败提醒：管理员至少知道访客发来
 // 过什么，回复占位卡照样能把话带回访客私聊。
@@ -3402,7 +3885,10 @@ async function relayUnsupportedPlaceholder(
       message_thread_id: Number(topicId),
       text:
         `📩 访客发来一条『${typeName}』，` +
-        '机器人无法转发本体。',
+        '机器人无法转发本体。' +
+        (buildUnsupportedSummary(message)
+          ? `\n${buildUnsupportedSummary(message)}`
+          : ''),
       disable_notification: Boolean(
         user.is_blocked || user.is_muted
       )
@@ -10691,6 +11177,51 @@ async function handleMyChatMember(
   chatMember,
   env
 ) {
+  // 机器人自身在管理群的权限变动（掉权自检）：必须赶在
+  // 下面的私聊判断之前——群事件的 chat.type 不是
+  // private，原逻辑会直接扔掉，掉权无人知晓；而看门狗、
+  // 话题与置顶都依赖机器人是群管理员。
+  if (
+    chatMember &&
+    env.ADMIN_GROUP_ID &&
+    String(chatMember.chat?.id) ===
+      String(env.ADMIN_GROUP_ID)
+  ) {
+    const botId =
+      String(env.BOT_TOKEN || '').split(':')[0];
+    const target = chatMember.new_chat_member;
+
+    if (
+      botId &&
+      String(target?.user?.id || '') === botId
+    ) {
+      const wasAdmin = [
+        'administrator',
+        'creator'
+      ].includes(chatMember.old_chat_member?.status);
+      const isAdminNow =
+        target?.status === 'administrator';
+
+      if (wasAdmin && !isAdminNow) {
+        await notifyPrimaryAdmins(
+          env,
+          '⚠️ 机器人已失去管理群管理员权限：成员看门狗' +
+          '失效，话题与置顶等功能可能受限，请恢复管理员。'
+        );
+      } else if (!wasAdmin && isAdminNow) {
+        // 权限恢复：清掉看门狗基线，下次成员事件重拍
+        // （掉权期间的进出无法追溯，只能重新对齐）。
+        await dbConfigDelete('memberbase', env);
+
+        await notifyPrimaryAdmins(
+          env,
+          '✅ 机器人已恢复管理群管理员权限，成员看门狗' +
+          '基线将在下一次成员变动时重新建立。'
+        );
+      }
+    }
+  }
+
   if (
     !chatMember ||
     chatMember.chat?.type !== 'private'
@@ -10777,6 +11308,163 @@ function describeChatMemberUser(user) {
 // 去重双保险：只认「不在群 → 在群」的跃迁，且首次告警
 // 用 dbConfigClaim 原子占下 memberalert:<uid> 标记；
 // 对方离群时清标记，再进群可再告警。
+// 成员看门狗的豁免名单（member_allow_ids，JSON 数组
+// 字符串，口径同协管员名单）：名单内账号进群不告警。
+// 解析失败按空名单处理，绝不让名单本身成为故障源。
+async function getMemberAllowIds(env) {
+  try {
+    return parseAuthorizedAdmins(
+      await getConfig('member_allow_ids', env, '[]')
+    );
+  } catch (_) {
+    return [];
+  }
+}
+
+// 看门狗基线对账：memberbase = {count, adminIds, net,
+// ts, lastAlerted?}——基线时刻的实际人数与管理员名单、
+// 基线之后的净进出数。每次成员事件后用「实际人数 vs
+// 基线 + 净变动」核对，补事件驱动看门狗的盲区（事件
+// 丢失、机器人掉线期间的进出）。基线接口失败时整体跳
+// 过，不阻断看门狗告警本身。
+async function loadMemberBase(env) {
+  const base = safeJsonParse(
+    await dbConfigGet('memberbase', env),
+    null
+  );
+
+  if (
+    !base ||
+    typeof base !== 'object' ||
+    !Number.isFinite(Number(base.count))
+  ) {
+    return null;
+  }
+
+  return base;
+}
+
+async function snapshotMemberBase(env, groupId) {
+  const countRes = await telegramApi(
+    env.BOT_TOKEN,
+    'getChatMemberCount',
+    { chat_id: groupId }
+  );
+  const adminsRes = await telegramApi(
+    env.BOT_TOKEN,
+    'getChatAdministrators',
+    { chat_id: groupId }
+  );
+
+  const count = Number(countRes);
+
+  if (!Number.isFinite(count)) {
+    return null;
+  }
+
+  const adminIds = (
+    Array.isArray(adminsRes) ? adminsRes : []
+  )
+    .map((entry) => String(entry?.user?.id || ''))
+    .filter(Boolean);
+
+  const base = {
+    count,
+    adminIds,
+    net: 0,
+    ts: Date.now()
+  };
+
+  await dbConfigPut(
+    'memberbase',
+    JSON.stringify(base),
+    env
+  );
+
+  return base;
+}
+
+async function reconcileMemberBase(
+  env,
+  groupId,
+  joined,
+  left
+) {
+  try {
+    let base = await loadMemberBase(env);
+    let justTaken = false;
+
+    if (!base) {
+      base = await snapshotMemberBase(env, groupId);
+
+      if (!base) {
+        return;
+      }
+
+      // 基线人数是事件发生之后读到的，已包含本事件，
+      // 这次不再叠加净变动。
+      justTaken = true;
+    }
+
+    if (!justTaken) {
+      const delta =
+        (joined ? 1 : 0) - (left ? 1 : 0);
+
+      if (delta !== 0) {
+        base.net = (Number(base.net) || 0) + delta;
+        base.ts = Date.now();
+
+        await dbConfigPut(
+          'memberbase',
+          JSON.stringify(base),
+          env
+        );
+      }
+    }
+
+    const actual = Number(
+      await telegramApi(
+        env.BOT_TOKEN,
+        'getChatMemberCount',
+        { chat_id: groupId }
+      )
+    );
+
+    if (!Number.isFinite(actual)) {
+      return;
+    }
+
+    const expected =
+      Number(base.count) + (Number(base.net) || 0);
+
+    if (
+      actual !== expected &&
+      Number(base.lastAlerted) !== actual
+    ) {
+      base.lastAlerted = actual;
+      base.ts = Date.now();
+
+      await dbConfigPut(
+        'memberbase',
+        JSON.stringify(base),
+        env
+      );
+
+      await notifyPrimaryAdmins(
+        env,
+        '⚠️ 管理群成员数与记录不符（记录 ' +
+          `${expected} 人、实际 ${actual} 人），` +
+          '可能有未记录的进出，请人工核查'
+      );
+    }
+  } catch (error) {
+    console.error(
+      '看门狗基线对账失败：',
+      error?.message || error
+    );
+  }
+}
+
 async function handleGroupChatMember(chatMember, env) {
   if (
     !chatMember ||
@@ -10790,6 +11478,17 @@ async function handleGroupChatMember(chatMember, env) {
   const target = newMember?.user;
   const targetId =
     target?.id != null ? String(target.id) : '';
+
+  // 基线对账先行（失败静默跳过）：进/出按 old/new 的
+  // 在群状态判定，与下面告警口径一致。
+  await reconcileMemberBase(
+    env,
+    String(env.ADMIN_GROUP_ID),
+    chatMemberInGroup(newMember) &&
+      !chatMemberInGroup(chatMember.old_chat_member),
+    !chatMemberInGroup(newMember) &&
+      chatMemberInGroup(chatMember.old_chat_member)
+  );
 
   if (!targetId) {
     return;
@@ -10824,6 +11523,12 @@ async function handleGroupChatMember(chatMember, env) {
   }
 
   if (await isAdminUser(targetId, env)) {
+    return;
+  }
+
+  if (
+    (await getMemberAllowIds(env)).includes(targetId)
+  ) {
     return;
   }
 
@@ -11680,7 +12385,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.4.0';
+const BOT_VERSION = 'v1.4.1';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -12489,35 +13194,128 @@ async function consumeActionNonce(
 
 // 管理审计只记元数据：谁、何时、对哪个目标、做了什么、
 // 结果如何。绝不记备注全文、配置值与任何 token / 签名。
+async function insertAdminAuditRow(
+  env,
+  adminId,
+  action,
+  target,
+  result,
+  detail = '',
+  opts = {}
+) {
+  await env.TG_BOT_DB.prepare(
+    'INSERT INTO admin_audit ' +
+      '(ts, admin_id, action, target, result, detail, ' +
+      'epoch, ip) ' +
+      'VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  ).bind(
+    Date.now(),
+    String(adminId || ''),
+    String(action || ''),
+    String(target || ''),
+    String(result || ''),
+    String(detail || '').slice(0, 64),
+    String(opts?.epoch ?? ''),
+    String(opts?.ip ?? '')
+  ).run();
+}
+
+// 普通审计：写失败只记账不阻断——审计是留痕，不能反过
+// 来把业务拖死。失败置 audit_degraded 标记，管理台顶部
+// 横幅提示「可能有操作未被记录」；下一次任意写成功清
+// 除标记。
 async function writeAdminAudit(
   env,
   adminId,
   action,
   target,
   result,
-  detail = ''
+  detail = '',
+  opts = {}
 ) {
   try {
-    await env.TG_BOT_DB.prepare(
-      'INSERT INTO admin_audit ' +
-        '(ts, admin_id, action, target, result, detail) ' +
-        'VALUES (?, ?, ?, ?, ?, ?)'
-    )
-      .bind(
-        Date.now(),
-        String(adminId || ''),
-        String(action || ''),
-        String(target || ''),
-        String(result || ''),
-        String(detail || '').slice(0, 64)
-      )
-      .run();
+    await insertAdminAuditRow(
+      env,
+      adminId,
+      action,
+      target,
+      result,
+      detail,
+      opts
+    );
+
+    try {
+      await dbConfigDelete('audit_degraded', env);
+    } catch (_) {
+      // 清标记失败不影响本次审计已落库。
+    }
   } catch (error) {
     console.error(
       '写入管理审计失败：',
       error?.message || error
     );
+
+    try {
+      await dbConfigPut(
+        'audit_degraded',
+        String(Date.now()),
+        env
+      );
+    } catch (_) {
+      // 标记也写不进去时只能靠控制台日志兜底。
+    }
   }
+}
+
+// 严格审计：写失败抛错。只用在最敏感动作执行前的
+// intent 审计——宁可拒绝执行，也不让一次无痕的高危
+// 操作溜过去。动作完成后的结果审计仍走普通 fail-open，
+// 不把已完成的动作改判失败。
+async function writeAdminAuditStrict(
+  env,
+  adminId,
+  action,
+  target,
+  result,
+  detail = '',
+  opts = {}
+) {
+  await insertAdminAuditRow(
+    env,
+    adminId,
+    action,
+    target,
+    result,
+    detail,
+    opts
+  );
+
+  try {
+    await dbConfigDelete('audit_degraded', env);
+  } catch (_) {
+    // 清标记失败不影响本次审计已落库。
+  }
+}
+
+// 审计归因上下文：epoch = 本次请求验签所用的当前 epoch
+// （吊销之后旧 epoch 的操作一眼可辨），ip = 请求来源。
+// 在网页链 handler 里组装一次、随每次审计写传入；拿不
+// 到留空，不硬凑。
+async function auditOpts(request, env, scope) {
+  let epoch = '';
+
+  try {
+    epoch = String(
+      await getLinkEpoch(env, scope || 'panel')
+    );
+  } catch (_) {
+    epoch = '';
+  }
+
+  return {
+    epoch,
+    ip: request?.headers?.get('CF-Connecting-IP') || ''
+  };
 }
 
 async function cleanupOldAuditRows(env) {
@@ -12558,6 +13356,54 @@ async function sweepExpiredNonces(env) {
   }
 }
 
+// 三页链接即将过期的固定横幅脚本：剩余时间由页面自己
+// 读 URL 参数 e（exp，毫秒）算，≤120 秒才亮，每 30 秒
+// 复查一次。机器人用户名只取 getMe 缓存（sys:bot-
+// username，命令处理时写入）——页面渲染不现拉 getMe，
+// 缓存为空就不附「去机器人」按钮、只显示纯文案，绝不
+// 硬编码用户名。
+function expiryBannerScript(botUsername) {
+  const user = /^[A-Za-z0-9_]{3,}$/.test(
+    botUsername || ''
+  )
+    ? botUsername
+    : '';
+
+  return `<script>
+var BOTU = ${JSON.stringify(user)};
+(function () {
+  var exp = Number(
+    new URLSearchParams(location.search).get('e') || 0
+  );
+  if (!exp) return;
+  function tick() {
+    var left = exp - Date.now();
+    var bar = document.getElementById('expbar');
+    if (left > 0 && left <= 120000) {
+      if (!bar) {
+        bar = document.createElement('div');
+        bar.id = 'expbar';
+        bar.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:60;background:#57452a;color:#ecd9ac;padding:10px 14px;font-size:14px;text-align:center;box-shadow:0 -2px 10px rgba(0,0,0,.35)';
+        bar.textContent = '⏳ 本页链接即将过期，请回到与机器人的私聊发送 /start 换新链接。';
+        if (BOTU) {
+          var a = document.createElement('a');
+          a.href = 'https://t.me/' + BOTU;
+          a.textContent = '去机器人';
+          a.style.cssText = 'color:#ffd479;margin-left:10px;text-decoration:underline';
+          bar.appendChild(a);
+        }
+        document.body.appendChild(bar);
+      }
+    } else if (bar) {
+      bar.remove();
+    }
+  }
+  tick();
+  setInterval(tick, 30000);
+})();
+</script>`;
+}
+
 async function signedPageResponse(
   request,
   env,
@@ -12585,7 +13431,32 @@ async function signedPageResponse(
     );
   }
 
-  return new Response(builder(), {
+  const pageCtx = {
+    botUsername: '',
+    auditDegraded: false
+  };
+
+  try {
+    const cached = String(
+      (await dbConfigGet('sys:bot-username', env)) || ''
+    );
+
+    if (/^[A-Za-z0-9_]{3,}$/.test(cached)) {
+      pageCtx.botUsername = cached;
+    }
+  } catch (_) {
+    // 用户名缓存读不到就只显示纯文案横幅。
+  }
+
+  try {
+    pageCtx.auditDegraded = Boolean(
+      await dbConfigGet('audit_degraded', env)
+    );
+  } catch (_) {
+    pageCtx.auditDegraded = false;
+  }
+
+  return new Response(await builder(pageCtx), {
     status: 200,
     headers: {
       'content-type': 'text/html; charset=utf-8',
@@ -12637,6 +13508,54 @@ async function handleUserListPage(request, env) {
   );
 }
 
+// 存量访客的搜索字段懒回填：每请求按 50 行一批推进，
+// 直到没有待回填行或单请求推进满 10 批（500 行）为止；
+// 新访客建档/刷新资料时已同写，不走这里。回填只写搜索
+// 列、不动 updated_at，免得把列表排序搅乱。
+async function backfillUserSearchFields(env) {
+  try {
+    for (let round = 0; round < 10; round += 1) {
+      const result = await env.TG_BOT_DB.prepare(
+        'SELECT user_id, user_info_json FROM users ' +
+        'WHERE search_name IS NULL ' +
+        'AND user_info_json IS NOT NULL LIMIT 50'
+      ).all();
+
+      const rows = result?.results || [];
+
+      if (!rows.length) {
+        return;
+      }
+
+      for (const row of rows) {
+        const derived = deriveUserSearchFields(
+          safeJsonParse(row.user_info_json, null)
+        );
+
+        await env.TG_BOT_DB.prepare(
+          'UPDATE users SET search_name = ?, ' +
+          'search_username = ? WHERE user_id = ?'
+        )
+          .bind(
+            derived.name,
+            derived.username,
+            String(row.user_id)
+          )
+          .run();
+      }
+
+      if (rows.length < 50) {
+        return;
+      }
+    }
+  } catch (error) {
+    console.error(
+      '回填访客搜索字段失败：',
+      error?.message || error
+    );
+  }
+}
+
 async function handleUserListApi(request, env) {
   const adminId =
     await panelQueryAdminId(request, env);
@@ -12647,6 +13566,8 @@ async function handleUserListApi(request, env) {
       { status: 403 }
     );
   }
+
+  await backfillUserSearchFields(env);
 
   const url = new URL(request.url);
 
@@ -12706,10 +13627,12 @@ async function handleUserListApi(request, env) {
     stateSql = 'is_blocked = 1';
   }
 
-  // 搜索：备注 / 姓名 / 用户名 / ID 子串匹配。姓名与用户名
-  // 存在 user_info_json 里，按原文子串命中（与旧前端在解析
-  // 后字段上做子串匹配的口径基本一致）；LIKE 通配符先转义，
-  // 搜 '%'、'_' 只按字面量找，全部参数绑定。
+  // 搜索：备注 / 姓名 / 用户名 / ID 子串匹配。姓名与用户
+  // 名查独立小写列（search_name / search_username，建档
+  // 与刷新资料时同写、存量懒回填），不再对 user_info_json
+  // 原文做 LIKE——原文里的 JSON 键名会误命中、带转义的
+  // 名字又对不上。pattern 同样小写化；LIKE 通配符先转
+  // 义，搜 '%'、'_' 只按字面量找，全部参数绑定。
   const q = String(
     url.searchParams.get('q') || ''
   ).trim();
@@ -12721,6 +13644,7 @@ async function handleUserListApi(request, env) {
     const pattern =
       '%' +
       q
+        .toLowerCase()
         .replace(/\\/g, '\\\\')
         .replace(/%/g, '\\%')
         .replace(/_/g, '\\_') +
@@ -12728,10 +13652,16 @@ async function handleUserListApi(request, env) {
 
     searchSql =
       "(admin_note LIKE ? ESCAPE '\\' OR " +
-      "user_info_json LIKE ? ESCAPE '\\' OR " +
+      "search_name LIKE ? ESCAPE '\\' OR " +
+      "search_username LIKE ? ESCAPE '\\' OR " +
       "user_id LIKE ? ESCAPE '\\')";
 
-    searchBinds.push(pattern, pattern, pattern);
+    searchBinds.push(
+      pattern,
+      pattern,
+      pattern,
+      pattern
+    );
   }
 
   // 游标分页（keyset）：游标是不透明串，编码 {s 排序档,
@@ -12750,7 +13680,7 @@ async function handleUserListApi(request, env) {
   const cursorRaw = url.searchParams.get('cursor');
 
   if (cursorRaw) {
-    const decoded = decodeListCursor(cursorRaw);
+    const decoded = await decodeListCursor(cursorRaw, env);
 
     if (
       decoded &&
@@ -12903,11 +13833,14 @@ async function handleUserListApi(request, env) {
   if (hasMore && rows.length) {
     const last = rows[rows.length - 1];
 
-    nextCursor = encodeListCursor({
-      s: sort,
-      k: Number(last[sortCol]) || 0,
-      id: String(last.user_id)
-    });
+    nextCursor = await encodeListCursor(
+      {
+        s: sort,
+        k: Number(last[sortCol]) || 0,
+        id: String(last.user_id)
+      },
+      env
+    );
   }
 
   const groupLinkId = String(
@@ -12931,7 +13864,11 @@ async function handleUserListApi(request, env) {
   });
 }
 
-function encodeListCursor(obj) {
+// 游标格式：<base64url 载荷>.<HMAC 签名>。签名复用链接
+// 签名密钥：游标虽不是提权面（有链接本就能翻全量），但
+// 篡改出的畸形游标会让翻页落进异常状态，签名后验不过
+// 一律按第一页处理，与「游标损坏」同口径。
+async function encodeListCursor(obj, env) {
   const bytes = new TextEncoder().encode(
     JSON.stringify(obj)
   );
@@ -12942,15 +13879,43 @@ function encodeListCursor(obj) {
     bin += String.fromCharCode(b);
   }
 
-  return btoa(bin)
+  const payload = btoa(bin)
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
     .replace(/=+$/, '');
+
+  const signature = await hmacSha256Hex(
+    linkSecret(env),
+    `list-cursor-v1|${payload}`
+  );
+
+  return `${payload}.${signature}`;
 }
 
-function decodeListCursor(raw) {
+async function decodeListCursor(raw, env) {
   try {
-    const b64 = String(raw)
+    const text = String(raw || '');
+    const dot = text.lastIndexOf('.');
+
+    if (dot <= 0) {
+      return null;
+    }
+
+    const payload = text.slice(0, dot);
+    const signature = text.slice(dot + 1);
+
+    const expected = await hmacSha256Hex(
+      linkSecret(env),
+      `list-cursor-v1|${payload}`
+    );
+
+    if (
+      !timingSafeEqualString(signature, expected)
+    ) {
+      return null;
+    }
+
+    const b64 = payload
       .replace(/-/g, '+')
       .replace(/_/g, '/');
 
@@ -13179,7 +14144,7 @@ async function handleGuidePage(request, env) {
   );
 }
 
-function buildGuidePage() {
+function buildGuidePage(pageCtx = {}) {
   return `<!doctype html>
 <html lang=\"zh-CN\">
 <head>
@@ -13315,12 +14280,12 @@ function buildGuidePage() {
       <li><b class=\"k\">类型过滤：</b>不想转发的消息类型（贴纸、语音、视频等）在这里关掉，对方发了也不会过到对面去。</li>
       <li><b class=\"k\">屏蔽关键词：</b>访客的话里出现关键词会被拦下并记一次数，次数达到你设的阈值就自动封禁他，口径与手动封禁完全一致（新消息即删、同样发送封禁通知）。不会写正则表达式也没关系，直接填普通词句就行。</li>
       <li><b class=\"k\">自动回复：</b>访客的话包含某个词时，机器人自动回一句你预设的话（比如包含「价格」就自动回价目说明）。</li>
-      <li><b class=\"k\">协管员：</b>把帮你接待的人的 Telegram 数字 ID 填进来（多个用逗号隔开）。协管员能在话题里回复、用命令、贴表情，但进不了网页管理台，也看不到访客列表。</li>
+      <li><b class=\"k\">协管员：</b>把帮你接待的人的 Telegram 数字 ID 填进来（多个用逗号隔开）。协管员能在话题里回复、用命令、贴表情，但进不了网页管理台，也看不到访客列表；这一区还有一份「成员看门狗豁免名单」，把合法的其他机器人或账号 ID 填进去，它们进管理群时就不会触发成员告警。</li>
       <li><b class=\"k\">服务熔断：</b>被消息轰炸时在这里一键暂停机器人（或用 /pause 命令），可设定暂停时长、到期自动恢复；还能设置暂停期间给访客的回复语句，或关掉回复保持完全静默。</li>
       <li><b class=\"k\">文案与呈现：</b>验证成功 / 答错、熔断恢复、拉黑 / 解封这几句机器人说的话，能改成你自己的口气；话题名的样式（备注在前还是名字在前、带不带 ID）、主菜单上显示哪些按钮、访客列表默认排序与每页条数、时间显示的时区（默认 Asia/Singapore），也都在这里。</li>
-      <li><b class=\"k\">安全与审计：</b>网页链接万一泄露（截图、转发、浏览器历史都可能漏出去），可以在这里一键让访客列表 / 网页管理台 / 新手引导某一页的已发链接全部失效，再重新发送 /start 换新链接；谁在什么时候做过删除、发通行证、改配置这类敏感操作，这里也留有一份审计记录可查（保留 90 天）。</li>
+      <li><b class=\"k\">安全与审计：</b>网页链接万一泄露（截图、转发、浏览器历史都可能漏出去），可以在这里一键让访客列表 / 网页管理台 / 新手引导某一页的已发链接全部失效，再重新发送 /start 换新链接；谁在什么时候做过删除、发通行证、改配置这类敏感操作，这里也留有一份审计记录可查（保留 90 天）。吊销只影响网页链接，验证链接与一次性通行证不受影响；若怀疑签名密钥泄露，仅吊销不够，需要到 Cloudflare 换掉 LINK_SECRET（未设置时为 WEBHOOK_SECRET）并用新值重跑一次 setWebhook，旧签名才会全部作废。</li>
     </ul>
-    <div class=\"tip\">管理台的网页链接 10 分钟过期；打开时、或者开着页面闲置超时后保存时，都会提示过期，重新发送 /start、在新主菜单上重新打开就行。</div>
+    <div class=\"tip\">管理台的网页链接 10 分钟过期；剩不到 2 分钟时，页面顶部会先亮一条横幅提醒；打开时、或者开着页面闲置超时后保存时，都会提示过期，重新发送 /start、在新主菜单上重新打开就行。</div>
   </section>
 
   <section id=\"g-users\">
@@ -13337,7 +14302,8 @@ function buildGuidePage() {
     <h2>🛡 管理群成员纪律</h2>
     <ul>
       <li><b class=\"k\">群里能看，就等于能看全部对话：</b>每位访客的对话都在管理群的话题里，任何群成员都能翻看全部话题与资料卡（姓名、用户名、ID、你写的备注）。机器人能拦住非管理员在话题里发言、发命令，<b class=\"k\">拦不住阅读</b>——所以管理群的成员必须严格只限主管理员与协管员本人，不要把任何其他人拉进这个群。</li>
-      <li><b class=\"k\">看门狗只负责事后发现：</b>名单外账号（不是机器人自己、主管理员、协管员）进入管理群时，机器人会私聊告警全体主管理员：是谁、被谁拉入、经哪个邀请链接。但告警响起时对方可能已经看到话题历史了——它负责发现，不负责预防。</li>
+      <li><b class=\"k\">看门狗只负责事后发现：</b>名单外账号（不是机器人自己、主管理员、协管员，也不在豁免名单里）进入管理群时，机器人会私聊告警全体主管理员：是谁、被谁拉入、经哪个邀请链接。但告警响起时对方可能已经看到话题历史了——它负责发现，不负责预防。</li>
+      <li><b class=\"k\">还会对账和自检：</b>机器人会给群成员数留一份基线，之后每次成员变动都核对一次：实际人数对不上（比如机器人掉线期间有人进出）会提醒你人工核查；机器人自己被取消管理员权限时也会立刻告警（这时看门狗已经停摆），恢复管理员后会通知你并重新建立基线。</li>
       <li><b class=\"k\">预防靠群设置，建群后先做两件：</b>① 把「新成员可查看历史消息」关掉（群资料 → 编辑 → 聊天历史记录可见性，不同客户端叫法略有差异），新人进群就看不到旧话题；② 只让管理员能拉人：成员权限里关掉普通成员的「添加成员」，不用的邀请链接及时撤销。</li>
       <li><b class=\"k\">收到告警怎么办：</b>先确认是不是自己或协管员有意拉的人；不是的话立刻把对方移出群，再检查并重置邀请链接。</li>
     </ul>
@@ -13370,9 +14336,9 @@ function buildGuidePage() {
 
   <section id=\"g-limits\">
     <h2>🚧 已知不支持清单</h2>
-    <p>下面这些消息类型，Telegram 没有给机器人留「原样转发本体」的路。访客发来、本体复制失败时，话题里会落一张「📩 访客发来一条『类型』，机器人无法转发本体。」的<b class=\"k\">占位卡</b>，访客那边也会收到一句「这类消息机器人暂时无法转达，已提醒管理员。」（10 分钟内只提示一次）。占位卡和普通转发消息一样建了配对：你在话题里<b class=\"k\">回复占位卡，回复照样能转到访客私聊</b>；用 /delete 删占位卡，也会连带处理那条原消息。</p>
+    <p>下面这些消息类型，Telegram 没有给机器人留「原样转发本体」的路。访客发来、本体复制失败时，话题里会落一张<b class=\"k\">占位卡</b>：写明类型，并尽量附上内容摘要（投票的问题与选项、位置的经纬度、名片的姓名电话等），访客那边也会收到一句「这类消息机器人暂时无法转达，已提醒管理员。」（10 分钟内只提示一次）。占位卡和普通转发消息一样建了配对：你在话题里<b class=\"k\">回复占位卡，回复照样能转到访客私聊</b>；用 /delete 删占位卡，也会连带处理那条原消息。</p>
     <ul>
-      <li><b class=\"k\">投票：</b>投票本体转不过来，话题里只有占位卡——投不了票，也看不到选项与结果。需要表决时，让访客用文字把想法发过来。</li>
+      <li><b class=\"k\">投票：</b>投票本体转不过来，占位卡会带上问题与选项的文字（测验题不会带正确答案），但投不了票、也看不到投票结果。需要表决时，让访客用文字把想法发过来。</li>
       <li><b class=\"k\">实时位置：</b>位置本体转不过来；实时位置的后续移动走的是「编辑消息」，机器人不处理位置类编辑，位置不会跟着更新。一次性位置同样只有占位卡。</li>
       <li><b class=\"k\">游戏、发票：</b>本体转不过来，里面的交互（开始游戏、付款）也用不了，只有占位卡。</li>
       <li><b class=\"k\">联系人名片、骰子动画等特殊类型：</b>复制失败时同样落占位卡；能正常复制的（骰子动画通常可以）一切照旧，不会出现占位卡。</li>
@@ -13459,11 +14425,12 @@ function buildGuidePage() {
   }, { passive: true });
   gSpy();
 </script>
+${expiryBannerScript(pageCtx.botUsername)}
 </body>
 </html>`;
 }
 
-function buildPanelPage() {
+function buildPanelPage(pageCtx = {}) {
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -13521,7 +14488,7 @@ function buildPanelPage() {
     <a class="chip" href="#sec-security">安全与审计</a>
   </div>
 </header>
-<main id="main">
+<main id="main">${pageCtx.auditDegraded ? '<div style="background:#5c2222;color:#ffb4b4;border-radius:8px;padding:10px 12px;margin-bottom:12px">审计日志写入异常，以下操作可能未被记录</div>' : ''}
   <div class="empty" id="loading">加载中…</div>
 
   <section id="sec-base" hidden>
@@ -13633,6 +14600,10 @@ function buildPanelPage() {
     <div class="hint">协管员可在话题里回复访客、使用话题命令与资料卡按钮，但不能改配置。主管理员不在此列。</div>
     <button class="save" data-k="authorized_admins" data-t="f_admins">保存</button>
     <button class="save danger" id="admins_clear">清空协管员</button>
+    <label>成员看门狗豁免 ID 列表（英文逗号分隔）</label>
+    <textarea id="f_allowids" rows="2"></textarea>
+    <div class="hint">名单内的账号进入管理群不触发成员告警（例如你自己的小号）；他们没有协管员的操作权限，只是进群不报警。</div>
+    <button class="save" data-k="member_allow_ids" data-t="f_allowids">保存</button>
   </section>
   <section id="sec-pause" hidden>
     <h2>⏸ 服务熔断</h2>
@@ -13720,10 +14691,15 @@ function buildPanelPage() {
     <button class="save danger" id="revoke_usrlist">吊销访客列表链接</button>
     <button class="save danger" id="revoke_guide">吊销新手引导链接</button>
     <button class="save danger" id="revoke_panel">吊销管理台链接（本页也会失效）</button>
-    <label>管理操作审计（最近 100 条，保留 90 天）</label>
+    <div class="hint">吊销只让已发出的对应网页链接失效；验证链接与一次性通行证不受影响。若怀疑签名密钥泄露，仅吊销不够：请到 Cloudflare 把 LINK_SECRET（未设置 LINK_SECRET 时为 WEBHOOK_SECRET）换成新值，并用新值重跑一次 setWebhook，之后所有旧签名（含验证与通行证链接）全部作废。</div>
+    <label>管理操作审计（每页 100 条，保留 90 天）</label>
     <div class="hint">删除访客、发通行证、改信任与屏蔽、改配置、吊销链接的成功与失败都会记在这里。只记谁在何时对谁做了什么，不记备注内容与配置值。</div>
+    <input type="text" id="audit_f_admin" placeholder="按管理员 ID 筛选（可空）">
+    <input type="text" id="audit_f_action" placeholder="按动作筛选，如 delete / config_set（可空）">
+    <input type="text" id="audit_f_target" placeholder="按目标筛选，子串匹配（可空）">
     <button class="save" id="audit_load">刷新审计记录</button>
     <div id="audit_list"><div class="empty">点上面的按钮加载</div></div>
+    <button class="save" id="audit_next" style="display:none">下一页</button>
   </section>
 </main>
 <div id="toast"></div>
@@ -14023,6 +14999,7 @@ fetch('/api/config?' + qs.toString())
     setVal('f_rvttl', d.reverify_ttl_days);
     setVal('f_threshold', d.block_threshold);
     setVal('f_admins', (d.authorizedAdmins || []).join(', '));
+    setVal('f_allowids', (d.memberAllowIds || []).join(', '));
     setVal('f_pausereply', d.pause_reply_text || '请稍后再试');
     setVal('f_pausereplymode', d.pause_reply_enabled ? 'true' : 'false');
     applyPauseReply();
@@ -14155,36 +15132,65 @@ document.getElementById('revoke_usrlist').onclick = function () { revokeLinks('u
 document.getElementById('revoke_guide').onclick = function () { revokeLinks('guide', '新手引导'); };
 
 var AUDIT_ACTION = { config_set: '改配置', delete: '删除访客', pass: '发通行证', trust: '信任变更', block: '屏蔽变更', revoke_links: '吊销链接' };
+var auditCursor = null;
+function auditUrl(cursor) {
+  var q = new URLSearchParams(qs.toString());
+  var fa = document.getElementById('audit_f_admin').value.trim();
+  var fc = document.getElementById('audit_f_action').value.trim();
+  var ft = document.getElementById('audit_f_target').value.trim();
+  if (fa) q.set('admin', fa);
+  if (fc) q.set('action', fc);
+  if (ft) q.set('target', ft);
+  if (cursor) q.set('cursor', cursor);
+  return '/api/audit?' + q.toString();
+}
+function renderAuditRows(box, rows) {
+  rows.forEach(function (row) {
+    var item = document.createElement('div');
+    item.className = 'item';
+    var tx = document.createElement('div');
+    tx.className = 'tx';
+    tx.textContent = (AUDIT_ACTION[row.action] || row.action) + ' · 目标 ' + (row.target || '-') + ' · ' + row.result + (row.detail ? '（' + row.detail + '）' : '');
+    var sub = document.createElement('div');
+    sub.className = 'sub';
+    sub.textContent = (row.ts ? new Date(row.ts).toLocaleString('zh-CN', { hour12: false }) : '-') + ' · 管理员 ' + (row.admin_id || '-') + (row.ip ? ' · IP ' + row.ip : '') + (row.epoch ? ' · epoch ' + row.epoch : '');
+    tx.appendChild(sub);
+    item.appendChild(tx);
+    box.appendChild(item);
+  });
+}
+function showAuditPage(box, d, emptyText) {
+  box.textContent = '';
+  if (!d.rows.length) {
+    var e = document.createElement('div');
+    e.className = 'empty';
+    e.textContent = emptyText;
+    box.appendChild(e);
+  } else {
+    renderAuditRows(box, d.rows);
+  }
+  auditCursor = d.nextCursor || null;
+  document.getElementById('audit_next').style.display = auditCursor ? '' : 'none';
+}
 function loadAudit() {
   var box = document.getElementById('audit_list');
   box.textContent = '加载中…';
-  fetch('/api/audit?' + qs.toString()).then(function (r) { return r.json(); }).then(function (d) {
+  fetch(auditUrl(null)).then(function (r) { return r.json(); }).then(function (d) {
     if (!d.ok) { box.textContent = '加载失败：' + (d.error || ''); return; }
-    box.textContent = '';
-    if (!d.rows.length) {
-      var e = document.createElement('div');
-      e.className = 'empty';
-      e.textContent = '暂无记录';
-      box.appendChild(e);
-      return;
-    }
-    d.rows.forEach(function (row) {
-      var item = document.createElement('div');
-      item.className = 'item';
-      var tx = document.createElement('div');
-      tx.className = 'tx';
-      tx.textContent = (AUDIT_ACTION[row.action] || row.action) + ' · 目标 ' + (row.target || '-') + ' · ' + row.result + (row.detail ? '（' + row.detail + '）' : '');
-      var sub = document.createElement('div');
-      sub.className = 'sub';
-      sub.textContent = (row.ts ? new Date(row.ts).toLocaleString('zh-CN', { hour12: false }) : '-') + ' · 管理员 ' + (row.admin_id || '-');
-      tx.appendChild(sub);
-      item.appendChild(tx);
-      box.appendChild(item);
-    });
+    showAuditPage(box, d, '暂无记录');
   }).catch(function () { box.textContent = '加载失败'; });
 }
 document.getElementById('audit_load').onclick = loadAudit;
+document.getElementById('audit_next').onclick = function () {
+  if (!auditCursor) return;
+  var box = document.getElementById('audit_list');
+  fetch(auditUrl(auditCursor)).then(function (r) { return r.json(); }).then(function (d) {
+    if (!d.ok) return;
+    showAuditPage(box, d, '没有更多记录');
+  }).catch(function () {});
+};
 </script>
+${expiryBannerScript(pageCtx.botUsername)}
 </body>
 </html>`;
 }
@@ -14459,6 +15465,35 @@ function validateScalarConfig(key, rawValue) {
     return { value: JSON.stringify(ids) };
   }
 
+  if (key === 'member_allow_ids') {
+    if (raw.length > LIMITS.member_allow_ids) {
+      return { error: '豁免名单内容过长' };
+    }
+
+    const ids = [
+      ...new Set(
+        raw
+          .split(',')
+          .map((id) => id.trim())
+          .filter(Boolean)
+      )
+    ];
+
+    const invalidIds = ids.filter(
+      (id) => !/^\d+$/.test(id)
+    );
+
+    if (invalidIds.length > 0) {
+      return {
+        error:
+          '以下 ID 格式不正确：' +
+          invalidIds.slice(0, 5).join(', ')
+      };
+    }
+
+    return { value: JSON.stringify(ids) };
+  }
+
   if (key === 'pause_reply_enabled') {
     if (raw !== 'true' && raw !== 'false') {
       return { error: '开关值无效' };
@@ -14676,6 +15711,9 @@ async function handleConfigApi(request, env) {
     authorizedAdmins: parseAuthorizedAdmins(
       cfg('authorized_admins', '[]')
     ),
+    memberAllowIds: parseAuthorizedAdmins(
+      cfg('member_allow_ids', '[]')
+    ),
     relay_burst: clampShow('relay_burst', 30, 1, 100),
     relay_refill_per_sec:
       clampShow('relay_refill_per_sec', 5, 1, 20),
@@ -14738,6 +15776,8 @@ async function handleConfigSet(request, env) {
     return parsed.response;
   }
 
+  const aOpts = await auditOpts(request, env, 'panel');
+
   const { body, adminId } = parsed;
   const key = String(body?.key || '');
   const rawValue = Array.isArray(body?.value)
@@ -14754,7 +15794,7 @@ async function handleConfigSet(request, env) {
       'config_set',
       key,
       'failed',
-      'invalid'
+      'invalid', aOpts
     );
 
     return Response.json(
@@ -14781,13 +15821,34 @@ async function handleConfigSet(request, env) {
       'config_set',
       key,
       'rejected',
-      `nonce_${nonceVerdict}`
+      `nonce_${nonceVerdict}`, aOpts
     );
 
     return Response.json(
       { ok: false, error: 'nonce_invalid' },
       { status: 403 }
     );
+  }
+
+  // 改协管员名单是最敏感的配置：先落 intent 审计，
+  // 写不进去就拒绝执行。
+  if (key === 'authorized_admins') {
+    try {
+      await writeAdminAuditStrict(
+        env,
+        parsed.adminId,
+        'config_set',
+        key,
+        'intent',
+        '',
+        aOpts
+      );
+    } catch (_) {
+      return Response.json(
+        { ok: false, error: 'audit_unavailable' },
+        { status: 503 }
+      );
+    }
   }
 
   await setConfig(key, result.value, env);
@@ -14797,7 +15858,7 @@ async function handleConfigSet(request, env) {
     adminId,
     'config_set',
     key,
-    'ok'
+    'ok', '', aOpts
   );
 
   return Response.json({ ok: true });
@@ -14823,6 +15884,8 @@ async function handleConfigToggle(request, env) {
     return parsed.response;
   }
 
+  const aOpts = await auditOpts(request, env, 'panel');
+
   const { body, adminId } = parsed;
 
   const key = String(body?.key || '');
@@ -14834,7 +15897,7 @@ async function handleConfigToggle(request, env) {
       'config_toggle',
       key,
       'failed',
-      'invalid'
+      'invalid', aOpts
     );
 
     return Response.json(
@@ -14850,7 +15913,7 @@ async function handleConfigToggle(request, env) {
       'config_toggle',
       key,
       'failed',
-      'invalid'
+      'invalid', aOpts
     );
 
     return Response.json(
@@ -14877,7 +15940,7 @@ async function handleConfigToggle(request, env) {
       'config_toggle',
       key,
       'rejected',
-      `nonce_${nonceVerdict}`
+      `nonce_${nonceVerdict}`, aOpts
     );
 
     return Response.json(
@@ -14897,7 +15960,7 @@ async function handleConfigToggle(request, env) {
     adminId,
     'config_toggle',
     key,
-    'ok'
+    'ok', '', aOpts
   );
 
   return Response.json({ ok: true });
@@ -14909,6 +15972,8 @@ async function handleConfigPause(request, env) {
   if (parsed.response) {
     return parsed.response;
   }
+
+  const aOpts = await auditOpts(request, env, 'panel');
 
   const { body, adminId } = parsed;
   const action = String(body?.action || '');
@@ -14932,7 +15997,7 @@ async function handleConfigPause(request, env) {
         'config_pause',
         action,
         'rejected',
-        `nonce_${verdict}`
+        `nonce_${verdict}`, aOpts
       );
     }
 
@@ -14959,7 +16024,7 @@ async function handleConfigPause(request, env) {
         'config_pause',
         action,
         'failed',
-        'invalid'
+        'invalid', aOpts
       );
 
       return Response.json(
@@ -14987,7 +16052,7 @@ async function handleConfigPause(request, env) {
       adminId,
       'config_pause',
       action,
-      'ok'
+      'ok', '', aOpts
     );
 
     return Response.json({
@@ -15017,7 +16082,7 @@ async function handleConfigPause(request, env) {
         adminId,
         'config_pause',
         action,
-        'ok'
+        'ok', '', aOpts
       );
 
       return Response.json({
@@ -15034,7 +16099,7 @@ async function handleConfigPause(request, env) {
       adminId,
       'config_pause',
       action,
-      'ok'
+      'ok', '', aOpts
     );
 
     return Response.json({
@@ -15049,7 +16114,7 @@ async function handleConfigPause(request, env) {
     'config_pause',
     action,
     'failed',
-    'invalid'
+    'invalid', aOpts
   );
 
   return Response.json(
@@ -15064,6 +16129,8 @@ async function handleConfigList(request, env) {
   if (parsed.response) {
     return parsed.response;
   }
+
+  const aOpts = await auditOpts(request, env, 'panel');
 
   const { body, adminId } = parsed;
   const key = String(body?.key || '');
@@ -15089,7 +16156,7 @@ async function handleConfigList(request, env) {
         'config_list',
         key,
         'rejected',
-        `nonce_${verdict}`
+        `nonce_${verdict}`, aOpts
       );
     }
 
@@ -15179,7 +16246,7 @@ async function handleConfigList(request, env) {
         adminId,
         'config_list',
         key,
-        'ok'
+        'ok', '', aOpts
       );
 
       return Response.json({ ok: true, keywords });
@@ -15221,7 +16288,7 @@ async function handleConfigList(request, env) {
         adminId,
         'config_list',
         key,
-        'ok'
+        'ok', '', aOpts
       );
 
       return Response.json({ ok: true, keywords });
@@ -15330,7 +16397,7 @@ async function handleConfigList(request, env) {
         adminId,
         'config_list',
         key,
-        'ok'
+        'ok', '', aOpts
       );
 
       return Response.json({
@@ -15375,7 +16442,7 @@ async function handleConfigList(request, env) {
         adminId,
         'config_list',
         key,
-        'ok'
+        'ok', '', aOpts
       );
 
       return Response.json({
@@ -15487,6 +16554,8 @@ async function handleRevokeLinks(request, env) {
     return parsed.response;
   }
 
+  const aOpts = await auditOpts(request, env, 'panel');
+
   const scope = String(parsed.body?.scope || '');
 
   if (!['panel', 'usrlist', 'guide'].includes(scope)) {
@@ -15496,7 +16565,28 @@ async function handleRevokeLinks(request, env) {
     );
   }
 
-  const next = (await getLinkEpoch(env, scope)) + 1;
+  const currentEpoch = await getLinkEpoch(env, scope);
+
+  // 吊销是拿「无痕」换不来的动作：先落 intent 审计，
+  // 写不进去就拒绝执行。
+  try {
+    await writeAdminAuditStrict(
+      env,
+      parsed.adminId,
+      'revoke_links',
+      scope,
+      'intent',
+      `epoch=${currentEpoch}`,
+      aOpts
+    );
+  } catch (_) {
+    return Response.json(
+      { ok: false, error: 'audit_unavailable' },
+      { status: 503 }
+    );
+  }
+
+  const next = currentEpoch + 1;
 
   await dbConfigPut(
     `linkepoch:${scope}`,
@@ -15510,7 +16600,7 @@ async function handleRevokeLinks(request, env) {
     'revoke_links',
     scope,
     'ok',
-    `epoch=${next}`
+    `epoch=${next}`, aOpts
   );
 
   return Response.json({ ok: true, scope, epoch: next });
@@ -15527,14 +16617,137 @@ async function handleAuditApi(request, env) {
     );
   }
 
+  // 读取顺手清扫 90 天前审计行：删除幂等且便宜，但按
+  // config 时间戳节流到每小时至多一次，避免每次拉列表
+  // 都发一发 DELETE 写库。
+  try {
+    const lastSweep = Number(
+      (await dbConfigGet('audit_sweep_at', env)) || 0
+    );
+
+    if (Date.now() - lastSweep >= 60 * 60 * 1000) {
+      await dbConfigPut(
+        'audit_sweep_at',
+        String(Date.now()),
+        env
+      );
+
+      await env.TG_BOT_DB.prepare(
+        'DELETE FROM admin_audit WHERE ts < ?'
+      )
+        .bind(Date.now() - AUDIT_RETENTION_MS)
+        .run();
+    }
+  } catch (error) {
+    console.error(
+      '清扫过期审计行失败：',
+      error?.message || error
+    );
+  }
+
+  const url = new URL(request.url);
+  const limit = 100;
+  const where = [];
+  const binds = [];
+
+  // keyset 分页：游标编码 {ts, rowid}（admin_audit 无显
+  // 式主键，rowid 作同毫秒 tiebreaker），倒序翻页不重
+  // 不漏；游标已签名，验不过按第一页处理。
+  const cursorRaw =
+    url.searchParams.get('cursor') || '';
+
+  if (cursorRaw) {
+    const decoded = await decodeListCursor(
+      cursorRaw,
+      env
+    );
+
+    if (
+      decoded &&
+      decoded.s === 'audit' &&
+      decoded.id != null &&
+      Number.isFinite(Number(decoded.k))
+    ) {
+      where.push(
+        '(ts < ? OR (ts = ? AND rowid < ?))'
+      );
+      binds.push(
+        Number(decoded.k),
+        Number(decoded.k),
+        Number(decoded.id)
+      );
+    }
+  }
+
+  const adminFilter = String(
+    url.searchParams.get('admin') || ''
+  ).trim();
+
+  if (adminFilter) {
+    where.push('admin_id = ?');
+    binds.push(adminFilter);
+  }
+
+  const actionFilter = String(
+    url.searchParams.get('action') || ''
+  ).trim();
+
+  if (actionFilter) {
+    where.push('action = ?');
+    binds.push(actionFilter);
+  }
+
+  const targetFilter = String(
+    url.searchParams.get('target') || ''
+  ).trim();
+
+  if (targetFilter) {
+    const pattern =
+      '%' +
+      targetFilter
+        .replace(/\\/g, '\\\\')
+        .replace(/%/g, '\\%')
+        .replace(/_/g, '\\_') +
+      '%';
+
+    where.push("target LIKE ? ESCAPE '\\'");
+    binds.push(pattern);
+  }
+
   const result = await env.TG_BOT_DB.prepare(
-    'SELECT ts, admin_id, action, target, result, detail ' +
-      'FROM admin_audit ORDER BY ts DESC LIMIT 100'
-  ).all();
+    'SELECT rowid AS rowid, ts, admin_id, action, ' +
+      'target, result, detail, epoch, ip ' +
+      'FROM admin_audit' +
+      (where.length
+        ? ` WHERE ${where.join(' AND ')}`
+        : '') +
+      ' ORDER BY ts DESC, rowid DESC LIMIT ?'
+  )
+    .bind(...binds, limit + 1)
+    .all();
+
+  const rows = result?.results || [];
+  let nextCursor = null;
+
+  if (rows.length > limit) {
+    rows.length = limit;
+
+    const last = rows[rows.length - 1];
+
+    nextCursor = await encodeListCursor(
+      {
+        s: 'audit',
+        k: Number(last.ts) || 0,
+        id: Number(last.rowid) || 0
+      },
+      env
+    );
+  }
 
   return Response.json({
     ok: true,
-    rows: result?.results || []
+    rows,
+    nextCursor
   });
 }
 
@@ -15545,6 +16758,8 @@ async function handleUserListAction(request, env) {
   if (parsed.response) {
     return parsed.response;
   }
+
+  const aOpts = await auditOpts(request, env, 'usrlist');
 
   const body = parsed.body;
   const adminId = parsed.adminId;
@@ -15586,7 +16801,7 @@ async function handleUserListAction(request, env) {
         act,
         targetId,
         'rejected',
-        `nonce_${verdict}`
+        `nonce_${verdict}`, aOpts
       );
 
       return Response.json(
@@ -15630,7 +16845,7 @@ async function handleUserListAction(request, env) {
         'trust',
         targetId,
         'failed',
-        'not_found'
+        'not_found', aOpts
       );
 
       return Response.json(
@@ -15658,7 +16873,7 @@ async function handleUserListAction(request, env) {
         'trust',
         targetId,
         'ok',
-        'untrust'
+        'untrust', aOpts
       );
 
       return Response.json({ ok: true });
@@ -15673,7 +16888,7 @@ async function handleUserListAction(request, env) {
         'trust',
         targetId,
         'failed',
-        'bad_param'
+        'bad_param', aOpts
       );
 
       return Response.json(
@@ -15689,7 +16904,7 @@ async function handleUserListAction(request, env) {
         'trust',
         targetId,
         'failed',
-        'blocked'
+        'blocked', aOpts
       );
 
       return Response.json(
@@ -15722,7 +16937,7 @@ async function handleUserListAction(request, env) {
         'trust',
         targetId,
         'ok',
-        'trust'
+        'trust', aOpts
       );
 
       return Response.json({ ok: true });
@@ -15756,7 +16971,7 @@ async function handleUserListAction(request, env) {
       'trust',
       targetId,
       'ok',
-      'trust'
+      'trust', aOpts
     );
 
     return Response.json({ ok: true });
@@ -15782,7 +16997,7 @@ async function handleUserListAction(request, env) {
         'block',
         targetId,
         'ok',
-        'unblock'
+        'unblock', aOpts
       );
 
       return Response.json({ ok: true });
@@ -15797,7 +17012,7 @@ async function handleUserListAction(request, env) {
         'block',
         targetId,
         'failed',
-        'bad_param'
+        'bad_param', aOpts
       );
 
       return Response.json(
@@ -15820,7 +17035,7 @@ async function handleUserListAction(request, env) {
       'block',
       targetId,
       'ok',
-      'block'
+      'block', aOpts
     );
 
     return Response.json({ ok: true });
@@ -15866,6 +17081,25 @@ async function handleUserListAction(request, env) {
       return ng;
     }
 
+    // 删除（含整段清空）先落 intent 审计：写不进去就
+    // 拒绝执行，动作本身不可逆，不能无痕。
+    try {
+      await writeAdminAuditStrict(
+        env,
+        adminId,
+        'delete',
+        targetId,
+        'intent',
+        withTopic ? 'wipe' : 'record',
+        aOpts
+      );
+    } catch (_) {
+      return Response.json(
+        { ok: false, error: 'audit_unavailable' },
+        { status: 503 }
+      );
+    }
+
     let wipe = null;
 
     if (withTopic) {
@@ -15890,7 +17124,7 @@ async function handleUserListAction(request, env) {
       'delete',
       targetId,
       'ok',
-      withTopic ? 'wipe' : 'record'
+      withTopic ? 'wipe' : 'record', aOpts
     );
 
     return Response.json({ ok: true, wipe });
@@ -15906,7 +17140,7 @@ async function handleUserListAction(request, env) {
         'pass',
         targetId,
         'failed',
-        'verified'
+        'verified', aOpts
       );
 
       return Response.json(
@@ -15922,7 +17156,7 @@ async function handleUserListAction(request, env) {
         'pass',
         targetId,
         'failed',
-        'blocked'
+        'blocked', aOpts
       );
 
       return Response.json(
@@ -15998,7 +17232,7 @@ async function handleUserListAction(request, env) {
         'pass',
         targetId,
         'failed',
-        'send_failed'
+        'send_failed', aOpts
       );
 
       return Response.json(
@@ -16035,7 +17269,7 @@ async function handleUserListAction(request, env) {
       adminId,
       'pass',
       targetId,
-      'ok'
+      'ok', '', aOpts
     );
 
     return Response.json({ ok: true, passExp: exp });
@@ -16047,7 +17281,7 @@ async function handleUserListAction(request, env) {
   );
 }
 
-function buildUserListPage() {
+function buildUserListPage(pageCtx = {}) {
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -16622,6 +17856,7 @@ function uScrollTop() {
   uAnim = requestAnimationFrame(uStep);
 }
 </script>
+${expiryBannerScript(pageCtx.botUsername)}
 </body>
 </html>`;
 }
@@ -17269,6 +18504,27 @@ async function processWebhookUpdate(
       return 500;
     }
 
+    // 限流延迟不算处理失败：释放占位（attempts 不累计）、
+    // 回 500 等 Telegram 在限流窗口后重推，并给主管理员
+    // 一条节流提示。再久的限流也不会把消息误判成死信。
+    if (error?.name === 'RateLimitDeferred') {
+      try {
+        await claimUpdateRelease(
+          update.update_id,
+          env
+        );
+      } catch (bookkeepingError) {
+        console.error(
+          '释放限流占位失败：',
+          bookkeepingError?.message || bookkeepingError
+        );
+      }
+
+      await alertAdminsRateLimited(env);
+
+      return 500;
+    }
+
     let dead = false;
 
     try {
@@ -17291,12 +18547,17 @@ async function processWebhookUpdate(
           : '') +
         String(error?.message || error).slice(0, 300);
 
+      const summary = summarizeUpdateForAlert(update);
+
       await notifyPrimaryAdmins(
         env,
         '⚠️ 死信告警：一条 Telegram 更新连续处理失败 ' +
         '3 次，已停止重试。\n' +
         `update_id：${update.update_id}\n` +
-        `错误：${brief}`
+        `错误：${brief}` +
+        (summary.length
+          ? `\n${summary.join('\n')}`
+          : '')
       );
 
       return 200;

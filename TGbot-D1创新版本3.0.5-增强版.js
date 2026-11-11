@@ -12611,7 +12611,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.4.3';
+const BOT_VERSION = 'v1.4.4';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -17702,6 +17702,9 @@ function buildUserListPage(pageCtx = {}) {
   .sl { color: #9db2c5; font-size: 11.5px; margin-top: 1px; }
   .snote { color: #5f7488; font-size: 11.5px; margin-top: 9px; line-height: 1.5; }
   .sloading { color: #9db2c5; font-size: 13px; padding: 6px 0; }
+  #list.loading { opacity: .45; pointer-events: none; }
+  .loadhint { visibility: hidden; color: #9db2c5; font-size: 12.5px; padding: 0 2px 5px; }
+  .loadhint.on { visibility: visible; }
   @keyframes slideFromRight { from { opacity: 0; transform: translateX(28px); } to { opacity: 1; transform: translateX(0); } }
   @keyframes slideFromLeft { from { opacity: 0; transform: translateX(-28px); } to { opacity: 1; transform: translateX(0); } }
   .in-r { animation: slideFromRight .32s ease; }
@@ -17730,6 +17733,7 @@ function buildUserListPage(pageCtx = {}) {
     <option value="new">按最新注册</option>
     <option value="old">按最早注册</option>
   </select>
+  <div id="loadHint" class="loadhint">加载中…</div>
   <div id="list"><div class="empty">加载中…</div></div>
   <div class="pager">
     <button id="prev">← 上一页</button>
@@ -17771,7 +17775,19 @@ function fmt(ts) {
 // 列表数据改由服务端游标分页 + 搜索 + 状态筛选：本页只
 // 管按当前游标取一页回来渲染。筛选/搜索/排序变化都回到
 // 第一页（清游标栈）重新取。
+// 取数期间列表进加载态：容器变淡＋pointer-events 锁死旧行（防
+// 滞留期误点到上一筛选的访客），上方小字提示「加载中…」；响应
+// 渲染后退出。loadSeq 单调递增领号：连点筛选/搜索时旧响应若
+// 后到，序号对不上直接丢弃（不渲染、不动加载态），最新请求
+// 负责收尾。setListLoading 幂等，递归退页重复进入不闪烁。
+var loadSeq = 0;
+function setListLoading(on) {
+  document.getElementById('list').className = on ? 'loading' : '';
+  document.getElementById('loadHint').className = 'loadhint' + (on ? ' on' : '');
+}
 function loadUsers() {
+  var mySeq = ++loadSeq;
+  setListLoading(true);
   var params = new URLSearchParams(qs.toString());
   params.set('state', filt);
   if (query) params.set('q', query);
@@ -17783,8 +17799,10 @@ function loadUsers() {
   fetch('/api/users?' + params.toString())
     .then(function (r) { return r.json(); })
     .then(function (d) {
+      if (mySeq !== loadSeq) return;
       if (!d.ok) {
         document.getElementById('list').innerHTML = '<div class="empty">加载失败：无权访问或链接已过期，请回主菜单重新打开。</div>';
+        setListLoading(false);
         return;
       }
       rows = d.users;
@@ -17802,15 +17820,19 @@ function loadUsers() {
         }
       }
       if (!rows.length && cursorStack.length) {
-        // 当前页被删空了：自动退回上一页。
+        // 当前页被删空了：自动退回上一页。保持加载态不退出，
+        // 递归取数渲染后才收尾，避免中途闪一下恢复又变淡。
         curCursor = cursorStack.pop();
         loadUsers();
         return;
       }
       render();
+      setListLoading(false);
     })
     .catch(function () {
+      if (mySeq !== loadSeq) return;
       document.getElementById('list').innerHTML = '<div class="empty">加载失败，请回主菜单重新打开。</div>';
+      setListLoading(false);
     });
 }
 

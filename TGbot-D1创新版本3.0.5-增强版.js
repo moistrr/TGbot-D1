@@ -12611,7 +12611,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.4.4';
+const BOT_VERSION = 'v1.4.5';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -17654,8 +17654,8 @@ function buildUserListPage(pageCtx = {}) {
   header { position: fixed; top: 0; left: 0; right: 0; background: #17212b; padding: 12px 14px; z-index: 2; transform: translateZ(0); will-change: transform; }
   h1 { font-size: 17px; margin: 0 0 10px; }
   input[type=search] { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 8px; border: 1px solid #2b3a47; background: #0f141a; color: #e8edf2; font-size: 15px; }
-  .chips { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
-  .chip { padding: 5px 12px; border-radius: 999px; border: 1px solid #2b3a47; background: transparent; color: #9db2c5; font-size: 13px; cursor: pointer; }
+  .chips { display: flex; gap: 8px; flex-wrap: nowrap; position: sticky; top: 0; z-index: 1; background: #0f141a; padding: 10px 0 8px; }
+  .chip { flex: 1; padding: 8px 0; border-radius: 9px; border: 1px solid #2b3a47; background: transparent; color: #9db2c5; font-size: 14px; cursor: pointer; text-align: center; }
   .chip.on { background: #2b5278; color: #fff; border-color: #2b5278; }
   .tabs { display: flex; gap: 8px; margin-top: 10px; }
   .tab { flex: 1; padding: 8px 0; border-radius: 9px; border: 1px solid #2b3a47; background: transparent; color: #9db2c5; font-size: 14px; cursor: pointer; }
@@ -17692,6 +17692,10 @@ function buildUserListPage(pageCtx = {}) {
   .pager button { padding: 7px 16px; border-radius: 8px; border: 1px solid #2b3a47; background: #17212b; color: #e8edf2; cursor: pointer; }
   .pager button:disabled { opacity: .4; }
   #toast { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%); background: #2b5278; color: #fff; padding: 9px 16px; border-radius: 10px; display: none; font-size: 14px; }
+  #toTop { position: fixed; right: 18px; bottom: 18px; width: 48px; height: 48px; padding: 0; border: 1px solid rgba(255,255,255,.16); border-radius: 50%; background: rgba(38,56,74,.66); -webkit-backdrop-filter: blur(12px) saturate(1.5); backdrop-filter: blur(12px) saturate(1.5); color: #fff; cursor: pointer; box-shadow: 0 10px 28px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.15); z-index: 3; opacity: 0; visibility: hidden; pointer-events: none; display: flex; align-items: center; justify-content: center; transition: opacity .25s ease, visibility .25s ease, transform .15s ease; }
+  #toTop.show { opacity: 1; visibility: visible; pointer-events: auto; }
+  #toTop:active { transform: scale(.94); }
+  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) { #toTop { background: rgba(38,56,74,.88); } }
   .empty { text-align: center; color: #9db2c5; padding: 34px 0; }
   #statsBox { margin-bottom: 14px; }
   .stitle { font-size: 15px; font-weight: 600; margin: 2px 0 4px; }
@@ -17702,9 +17706,10 @@ function buildUserListPage(pageCtx = {}) {
   .sl { color: #9db2c5; font-size: 11.5px; margin-top: 1px; }
   .snote { color: #5f7488; font-size: 11.5px; margin-top: 9px; line-height: 1.5; }
   .sloading { color: #9db2c5; font-size: 13px; padding: 6px 0; }
-  #list.loading { opacity: .45; pointer-events: none; }
-  .loadhint { visibility: hidden; color: #9db2c5; font-size: 12.5px; padding: 0 2px 5px; }
-  .loadhint.on { visibility: visible; }
+  .loadingbox { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 40vh; gap: 12px; }
+  .spinner { width: 28px; height: 28px; border-radius: 50%; border: 3px solid #2b3a47; border-top-color: #8ecdf0; animation: spinRot .8s linear infinite; }
+  @keyframes spinRot { to { transform: rotate(360deg); } }
+  .loadingtxt { color: #9db2c5; font-size: 13px; }
   @keyframes slideFromRight { from { opacity: 0; transform: translateX(28px); } to { opacity: 1; transform: translateX(0); } }
   @keyframes slideFromLeft { from { opacity: 0; transform: translateX(-28px); } to { opacity: 1; transform: translateX(0); } }
   .in-r { animation: slideFromRight .32s ease; }
@@ -17733,8 +17738,7 @@ function buildUserListPage(pageCtx = {}) {
     <option value="new">按最新注册</option>
     <option value="old">按最早注册</option>
   </select>
-  <div id="loadHint" class="loadhint">加载中…</div>
-  <div id="list"><div class="empty">加载中…</div></div>
+  <div id="list"><div class="loadingbox"><div class="spinner"></div><div class="loadingtxt">加载中…</div></div></div>
   <div class="pager">
     <button id="prev">← 上一页</button>
     <span id="pinfo" style="color:#9db2c5;font-size:13px"></span>
@@ -17748,6 +17752,7 @@ function buildUserListPage(pageCtx = {}) {
   </section>
 </main>
 <div id="toast"></div>
+<button id="toTop" title="回到顶部" aria-label="回到顶部"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M5 15l7-7 7 7" stroke="#fff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
 <script>
 var qs = new URLSearchParams(location.search);
 var AUTH = { u: qs.get('u'), e: qs.get('e'), s: qs.get('s') };
@@ -17773,21 +17778,79 @@ function fmt(ts) {
 }
 
 // 列表数据改由服务端游标分页 + 搜索 + 状态筛选：本页只
-// 管按当前游标取一页回来渲染。筛选/搜索/排序变化都回到
-// 第一页（清游标栈）重新取。
-// 取数期间列表进加载态：容器变淡＋pointer-events 锁死旧行（防
-// 滞留期误点到上一筛选的访客），上方小字提示「加载中…」；响应
-// 渲染后退出。loadSeq 单调递增领号：连点筛选/搜索时旧响应若
-// 后到，序号对不上直接丢弃（不渲染、不动加载态），最新请求
-// 负责收尾。setListLoading 幂等，递归退页重复进入不闪烁。
+// 管按当前游标取一页回来渲染。
+// 取数期间列表区直接清空、只留居中加载块（转圈＋「加载中…」），
+// 分页与计数先以 visibility 藏起（占位不跳版），渲染或出错后
+// 恢复——旧行不滞留、没有可点的残留。loadSeq 单调递增领号：
+// 连点筛选/搜索时旧响应若后到，序号对不上直接丢弃（不渲染、
+// 不动加载块），最新请求负责收尾。删空整页自动退页的递归取
+// 数保持加载块，最终渲染后才收尾。
+// 位置回拉：posMem 以「筛选|搜索词」为键记每个视图的游标栈、
+// 当前游标与滚动位，只存页面内存；render 后 memSave 刷新当
+// 前键的游标位置，滚动监听与切换键前的 memLeave 维护滚动位。
+// 切回有记忆的视图时 enterKey 按记忆游标重新取新数据，渲染
+// 后经 pendingScrollY 瞬时滚回原位（递归退页中间不消费它）。
 var loadSeq = 0;
-function setListLoading(on) {
-  document.getElementById('list').className = on ? 'loading' : '';
-  document.getElementById('loadHint').className = 'loadhint' + (on ? ' on' : '');
+var posMem = {};
+var pendingScrollY = null;
+function posKey() { return filt + '|' + query; }
+function memSave() {
+  var m = posMem[posKey()] || (posMem[posKey()] = { stack: [], cursor: '', scrollY: 0 });
+  m.stack = cursorStack.slice();
+  m.cursor = curCursor;
+}
+function memLeave() {
+  var m = posMem[posKey()];
+  if (m) m.scrollY = window.pageYOffset || 0;
+}
+function enterKey() {
+  var m = posMem[posKey()];
+  if (m) {
+    cursorStack = m.stack.slice();
+    curCursor = m.cursor;
+    pendingScrollY = m.scrollY || 0;
+    loadUsers();
+    return true;
+  }
+  curCursor = '';
+  cursorStack = [];
+  pendingScrollY = null;
+  loadUsers();
+  return false;
+}
+// 回顶按钮显隐与位置记忆共用同一次节流滚动监听：仅当访客
+// 列表视图激活且向下滚动超过 200px 时渐显；切到数据统计
+// 页签时 showTab 也会重判一次（列表不在视图内强制隐藏）。
+function uTopBtn() {
+  var b = document.getElementById('toTop');
+  if (!b) return;
+  var listOn = document.getElementById('paneList').style.display !== 'none';
+  b.className = listOn && (window.pageYOffset || 0) > 200 ? 'show' : '';
+}
+var scrollTick = 0;
+window.addEventListener('scroll', function () {
+  var now = Date.now();
+  if (now - scrollTick < 120) return;
+  scrollTick = now;
+  memLeave();
+  uTopBtn();
+}, { passive: true });
+function showListLoading() {
+  document.getElementById('list').innerHTML = '<div class="loadingbox"><div class="spinner"></div><div class="loadingtxt">加载中…</div></div>';
+  var pg = document.querySelector('.pager');
+  if (pg) pg.style.visibility = 'hidden';
+  var cn = document.getElementById('cnt');
+  if (cn) cn.style.visibility = 'hidden';
+}
+function showListDone() {
+  var pg = document.querySelector('.pager');
+  if (pg) pg.style.visibility = '';
+  var cn = document.getElementById('cnt');
+  if (cn) cn.style.visibility = '';
 }
 function loadUsers() {
   var mySeq = ++loadSeq;
-  setListLoading(true);
+  showListLoading();
   var params = new URLSearchParams(qs.toString());
   params.set('state', filt);
   if (query) params.set('q', query);
@@ -17802,7 +17865,7 @@ function loadUsers() {
       if (mySeq !== loadSeq) return;
       if (!d.ok) {
         document.getElementById('list').innerHTML = '<div class="empty">加载失败：无权访问或链接已过期，请回主菜单重新打开。</div>';
-        setListLoading(false);
+        showListDone();
         return;
       }
       rows = d.users;
@@ -17820,19 +17883,24 @@ function loadUsers() {
         }
       }
       if (!rows.length && cursorStack.length) {
-        // 当前页被删空了：自动退回上一页。保持加载态不退出，
-        // 递归取数渲染后才收尾，避免中途闪一下恢复又变淡。
+        // 当前页被删空了：自动退回上一页。加载块保持不出，
+        // 递归取数渲染后才收尾；滚动恢复也等最终渲染消费。
         curCursor = cursorStack.pop();
         loadUsers();
         return;
       }
       render();
-      setListLoading(false);
+      showListDone();
+      if (pendingScrollY != null) {
+        var ry = pendingScrollY;
+        pendingScrollY = null;
+        requestAnimationFrame(function () { window.scrollTo(0, ry); });
+      }
     })
     .catch(function () {
       if (mySeq !== loadSeq) return;
       document.getElementById('list').innerHTML = '<div class="empty">加载失败，请回主菜单重新打开。</div>';
-      setListLoading(false);
+      showListDone();
     });
 }
 
@@ -17877,6 +17945,7 @@ function act(id, action, delTopic, note, extra) {
 }
 
 function render() {
+  memSave();
   var list = rows;
   document.getElementById('cnt').textContent = '共 ' + listTotal + ' 人';
   document.getElementById('pinfo').textContent = '第 ' + (cursorStack.length + 1) + ' 页' + (nextCursor ? ' · 还有更多' : '');
@@ -18090,21 +18159,43 @@ var qTimer = 0;
 document.getElementById('q').addEventListener('input', function (e) {
   var v = e.target.value.trim();
   clearTimeout(qTimer);
-  qTimer = setTimeout(function () { query = v; resetAndLoad(); }, 300);
+  qTimer = setTimeout(function () {
+    if (v === query) return;
+    memLeave();
+    query = v;
+    enterKey();
+  }, 300);
 });
 document.getElementById('chips').addEventListener('click', function (e) {
   if (!e.target.dataset || !e.target.dataset.f) return;
-  filt = e.target.dataset.f;
+  var nf = e.target.dataset.f;
+  var order = ['all', 'verified', 'pending', 'blocked'];
+  var ni = order.indexOf(nf);
+  var dir = ni >= prevFiltIdx ? 1 : -1;
+  prevFiltIdx = ni;
+  if (nf === filt) {
+    // 重复点当前筛选：沿旧行为回第一页重取。
+    resetAndLoad();
+    uScrollTop();
+    return;
+  }
+  memLeave();
+  filt = nf;
   var cs = document.querySelectorAll('.chip');
   for (var i = 0; i < cs.length; i++) cs[i].className = 'chip' + (cs[i].dataset.f === filt ? ' on' : '');
+  var had = enterKey();
+  slideIn(document.getElementById('list'), dir);
+  if (!had) uScrollTop();
+});
+document.getElementById('sort').addEventListener('change', function () {
+  sortMode = document.getElementById('sort').value;
+  // 排序变了，各视图记住的旧位置全部作废。boot 时 uiDefaults
+  // 回填 select 的值是程序赋值、不触发 change，不会误清。
+  posMem = {};
+  pendingScrollY = null;
   resetAndLoad();
-  var order = ['all', 'verified', 'pending', 'blocked'];
-  var ni = order.indexOf(filt);
-  slideIn(document.getElementById('list'), ni >= prevFiltIdx ? 1 : -1);
-  prevFiltIdx = ni;
   uScrollTop();
 });
-document.getElementById('sort').addEventListener('change', function () { sortMode = document.getElementById('sort').value; resetAndLoad(); uScrollTop(); });
 document.getElementById('prev').onclick = function () { if (cursorStack.length) { curCursor = cursorStack.pop(); loadUsers(); uScrollTop(); } };
 document.getElementById('next').onclick = function () { if (nextCursor) { cursorStack.push(curCursor); curCursor = nextCursor; loadUsers(); uScrollTop(); } };
 
@@ -18116,9 +18207,11 @@ function showTab(which) {
   document.getElementById('tabStats').className = 'tab' + (isStats ? ' on' : '');
   slideIn(document.getElementById(isStats ? 'paneStats' : 'paneList'), isStats ? 1 : -1);
   uScrollTop();
+  uTopBtn();
 }
 document.getElementById('tabList').onclick = function () { showTab('list'); };
 document.getElementById('tabStats').onclick = function () { showTab('stats'); };
+document.getElementById('toTop').onclick = function () { uScrollTop(); };
 
 function stile(v, l) {
   var d = document.createElement('div');
@@ -18198,6 +18291,9 @@ function uFixPad() {
   if (h && h !== uPad) {
     uPad = h;
     document.body.style.paddingTop = h + 'px';
+    // 筛选行吸顶位置跟随实测页眉高度（boot 与 resize 防抖共用此函数）。
+    var cp = document.getElementById('chips');
+    if (cp) cp.style.top = h + 'px';
   }
 }
 var uPadTimer = 0;

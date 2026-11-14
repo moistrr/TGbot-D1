@@ -12611,7 +12611,7 @@ async function purgeManagedUser(
 /*                         自动检查更新（改版新增）                             */
 /* -------------------------------------------------------------------------- */
 
-const BOT_VERSION = 'v1.4.5';
+const BOT_VERSION = 'v1.4.6';
 const UPDATE_REPO = 'realadmin/TGbot-D1';
 const UPDATE_CACHE_KEY = 'sys:latest-release';
 const UPDATE_NOTIFIED_KEY = 'sys:update-notified';
@@ -17650,7 +17650,7 @@ function buildUserListPage(pageCtx = {}) {
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   body { font-family: -apple-system, "Segoe UI", sans-serif; margin: 0; background: #0f141a; color: #e8edf2; padding-top: 104px; }
-  html { scroll-padding-top: 114px; }
+  html { scroll-padding-top: 114px; overflow-x: hidden; overflow-x: clip; }
   header { position: fixed; top: 0; left: 0; right: 0; background: #17212b; padding: 12px 14px; z-index: 2; transform: translateZ(0); will-change: transform; }
   h1 { font-size: 17px; margin: 0 0 10px; }
   input[type=search] { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 8px; border: 1px solid #2b3a47; background: #0f141a; color: #e8edf2; font-size: 15px; }
@@ -17710,6 +17710,7 @@ function buildUserListPage(pageCtx = {}) {
   .spinner { width: 28px; height: 28px; border-radius: 50%; border: 3px solid #2b3a47; border-top-color: #8ecdf0; animation: spinRot .8s linear infinite; }
   @keyframes spinRot { to { transform: rotate(360deg); } }
   .loadingtxt { color: #9db2c5; font-size: 13px; }
+  .listclip { overflow-x: hidden; overflow-x: clip; }
   @keyframes slideFromRight { from { opacity: 0; transform: translateX(28px); } to { opacity: 1; transform: translateX(0); } }
   @keyframes slideFromLeft { from { opacity: 0; transform: translateX(-28px); } to { opacity: 1; transform: translateX(0); } }
   .in-r { animation: slideFromRight .32s ease; }
@@ -17738,7 +17739,7 @@ function buildUserListPage(pageCtx = {}) {
     <option value="new">按最新注册</option>
     <option value="old">按最早注册</option>
   </select>
-  <div id="list"><div class="loadingbox"><div class="spinner"></div><div class="loadingtxt">加载中…</div></div></div>
+  <div class="listclip"><div id="list"><div class="loadingbox"><div class="spinner"></div><div class="loadingtxt">加载中…</div></div></div></div>
   <div class="pager">
     <button id="prev">← 上一页</button>
     <span id="pinfo" style="color:#9db2c5;font-size:13px"></span>

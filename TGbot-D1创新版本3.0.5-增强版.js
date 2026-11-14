@@ -14505,7 +14505,7 @@ function buildGuidePage(pageCtx = {}) {
 <title>新手引导</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  html { scroll-padding-top: 190px; }
+  html { scroll-padding-top: 190px; overflow-y: scroll; scrollbar-gutter: stable; }
   /* 章节跳转动画由脚本逐帧驱动，不用 CSS scroll-behavior 以免双重平滑互相干扰 */
   body { font-family: -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #0f1a24; color: #dbe6f2; padding-top: 190px; padding-bottom: 30px; }
   header { position: fixed; top: 0; left: 0; right: 0; background: #13222f; padding: 12px 14px 10px; border-bottom: 1px solid #22374a; z-index: 3; transform: translateZ(0); will-change: transform; }
@@ -14791,7 +14791,7 @@ function buildPanelPage(pageCtx = {}) {
 <title>网页管理台</title>
 <style>
   body { font-family: -apple-system, "Segoe UI", sans-serif; margin: 0; background: #0f141a; color: #e8edf2; padding-top: 104px; }
-  html { scroll-padding-top: 114px; }
+  html { scroll-padding-top: 114px; overflow-y: scroll; scrollbar-gutter: stable; }
   header { position: fixed; top: 0; left: 0; right: 0; background: #17212b; padding: 12px 14px; z-index: 2; transform: translateZ(0); will-change: transform; }
   h1 { font-size: 17px; margin: 0 0 10px; }
   .chips { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -17650,7 +17650,7 @@ function buildUserListPage(pageCtx = {}) {
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   body { font-family: -apple-system, "Segoe UI", sans-serif; margin: 0; background: #0f141a; color: #e8edf2; padding-top: 104px; }
-  html { scroll-padding-top: 114px; overflow-x: hidden; overflow-x: clip; }
+  html { scroll-padding-top: 114px; overflow-x: hidden; overflow-x: clip; overflow-y: scroll; scrollbar-gutter: stable; }
   header { position: fixed; top: 0; left: 0; right: 0; background: #17212b; padding: 12px 14px; z-index: 2; transform: translateZ(0); will-change: transform; }
   h1 { font-size: 17px; margin: 0 0 10px; }
   input[type=search] { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 8px; border: 1px solid #2b3a47; background: #0f141a; color: #e8edf2; font-size: 15px; }
